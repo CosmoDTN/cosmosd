@@ -88,6 +88,7 @@ All options:
 | `--node-id` | hostname | Human-readable node identifier |
 | `--relay-token` | — | Shared secret; peers must supply the same token |
 | `--no-discovery` | false | Disable mDNS auto-discovery |
+| `--bind` | `127.0.0.1` | HTTP API bind address (`0.0.0.0` to expose on all interfaces) |
 
 ---
 

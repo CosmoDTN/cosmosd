@@ -1,10 +1,10 @@
 [package]
 name = "cosmosd"
-version = "0.1.0-alpha"
+version = "0.2.0-alpha"
 edition = "2021"
 description = "Delay-tolerant streaming daemon — stream across the void"
 license = "MIT"
-repository = "https://github.com/cosmoscast/cosmosd"
+repository = "https://github.com/CosmoDTN/cosmosd"
 
 [[bin]]
 name = "cosmosd"
@@ -46,7 +46,8 @@ hostname = "0.3"
 mdns-sd = "0.10"
 async-trait = "0.1"
 base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3"

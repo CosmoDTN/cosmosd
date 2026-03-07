@@ -4,9 +4,11 @@
 //! to local apps via HTTP. Part of the CosmosD open-source framework.
 //!
 //! Usage:
-//!   cosmosd serve                  # Start daemon (default port 7777)
-//!   cosmosd serve --port 8888      # Custom port
-//!   cosmosd serve --store /data    # Custom store path
+//!   cosmosd serve                                    # Start daemon (default port 7777)
+//!   cosmosd serve --port 8888                        # Custom port
+//!   cosmosd serve --bind 0.0.0.0                     # Expose API on all interfaces
+//!   cosmosd ingest /path/to/movie.mkv                # Ingest a local file
+//!   cosmosd ingest /path/to/movie.mkv --title "Dune" # With custom title
 
 mod api;
 mod auth;
@@ -17,9 +19,11 @@ mod router;
 mod store;
 mod transport;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -72,6 +76,30 @@ enum Command {
         /// Disable mDNS peer discovery (useful in controlled environments).
         #[arg(long, default_value = "false")]
         no_discovery: bool,
+
+        /// Bind address for the HTTP API.
+        /// Use 0.0.0.0 to expose the API on all interfaces (e.g. for remote access).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
+
+    /// Ingest a local video file into the running cosmosd daemon.
+    /// Requires ffmpeg to be installed. The daemon must be running.
+    Ingest {
+        /// Path to the video file (mkv, mp4, avi, etc.).
+        file: PathBuf,
+
+        /// Content title. Defaults to the filename stem.
+        #[arg(long)]
+        title: Option<String>,
+
+        /// cosmosd HTTP API URL.
+        #[arg(long, default_value = "http://127.0.0.1:7777")]
+        daemon: String,
+
+        /// Bundle priority: vod, near_live, or live.
+        #[arg(long, default_value = "vod")]
+        priority: String,
     },
 }
 
@@ -86,8 +114,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery } => {
-            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery).await?;
+        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, bind } => {
+            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, bind).await?;
+        }
+        Command::Ingest { file, title, daemon, priority } => {
+            ingest_file(file, title, daemon, priority).await?;
         }
     }
 
@@ -102,6 +133,7 @@ async fn serve(
     initial_peers: Vec<String>,
     relay_token: Option<String>,
     no_discovery: bool,
+    bind: String,
 ) -> Result<()> {
     let node_id = node_id.unwrap_or_else(|| {
         hostname::get()
@@ -112,7 +144,7 @@ async fn serve(
 
     info!("CosmosD node:  {}", node_id);
     info!("Bundle store:  {}", store_path);
-    info!("HTTP API:      http://127.0.0.1:{}", port);
+    info!("HTTP API:      http://{}:{}", bind, port);
     info!("Relay port:    {}", relay_port);
 
     let store = Arc::new(BundleStore::open(&store_path)?);
@@ -169,10 +201,10 @@ async fn serve(
         info!("mDNS discovery enabled — auto-discovering peers on local network");
     }
 
-    // 8. HTTP API server (local only)
+    // 8. HTTP API server
     let state = ApiState { store, node_id, peers: peer_manager };
     let app = api::router(state);
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("{}:{}", bind, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     info!("Ready. Endpoints:");
@@ -183,4 +215,114 @@ async fn serve(
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// === Ingest subcommand ===
+
+async fn ingest_file(
+    file: PathBuf,
+    title: Option<String>,
+    daemon: String,
+    priority: String,
+) -> Result<()> {
+    let file = file.canonicalize().context("File not found")?;
+    let title = title.unwrap_or_else(|| {
+        file.file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
+    let content_id = file
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase()
+        .replace(' ', "_")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .take(40)
+        .collect::<String>();
+
+    // 1. Check ffmpeg is available
+    which_ffmpeg().context("ffmpeg not found — install it: apt install ffmpeg / brew install ffmpeg")?;
+
+    // 2. Check daemon is reachable
+    let client = reqwest::Client::new();
+    client
+        .get(format!("{}/health", daemon))
+        .send()
+        .await
+        .context("Cannot reach cosmosd — is it running? cosmosd serve")?;
+
+    info!("Ingesting: {}", title);
+    info!("File:      {}", file.display());
+    info!("Content ID:{}", content_id);
+    info!("Daemon:    {}", daemon);
+
+    // 3. Chunk into HLS segments with ffmpeg
+    let tmp = tempfile::tempdir()?;
+    let hls_dir = tmp.path();
+
+    info!("Chunking with ffmpeg...");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-i", file.to_str().unwrap(),
+            "-codec", "copy",
+            "-hls_time", "10",
+            "-hls_list_size", "0",
+            "-hls_segment_filename", &format!("{}/seg%05d.ts", hls_dir.display()),
+            "-f", "hls",
+            &format!("{}/index.m3u8", hls_dir.display()),
+        ])
+        .status()
+        .context("ffmpeg failed to run")?;
+
+    anyhow::ensure!(status.success(), "ffmpeg exited with error");
+
+    // 4. Push each segment to cosmosd
+    let mut segments: Vec<_> = std::fs::read_dir(hls_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "ts").unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    segments.sort();
+
+    info!("Pushing {} segments to {}...", segments.len(), daemon);
+
+    for (i, seg_path) in segments.iter().enumerate() {
+        let payload = std::fs::read(seg_path)?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
+
+        let resp = client
+            .post(format!("{}/ingest", daemon))
+            .json(&serde_json::json!({
+                "content_id":    content_id,
+                "content_title": title,
+                "sequence":      i,
+                "mime_type":     "video/mp2t",
+                "priority":      priority,
+                "payload_b64":   b64,
+            }))
+            .send()
+            .await
+            .with_context(|| format!("Failed to push segment {}", i))?;
+
+        let data: serde_json::Value = resp.json().await?;
+        info!("  seg{:05} → {} (stored={})", i, data["bundle_id"], data["stored"]);
+    }
+
+    info!("Done: {} ({} segments)", title, segments.len());
+    info!("Play: ffplay {}/play/{}", daemon, content_id);
+    Ok(())
+}
+
+fn which_ffmpeg() -> Option<()> {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
+        .filter(|s| s.success())
+        .map(|_| ())
 }

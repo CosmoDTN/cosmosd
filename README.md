@@ -36,6 +36,12 @@ brew tap CosmoDTN/tap
 brew install cosmosd
 ```
 
+### cargo install (Linux / Windows / macOS)
+
+```bash
+cargo install cosmosd
+```
+
 ### From source
 
 **Prerequisites:** Rust 1.78+

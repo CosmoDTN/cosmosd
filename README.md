@@ -12,7 +12,7 @@ Designed for networks where internet connectivity is absent, intermittent, or ex
 
 ## How it works
 
-Content is chunked into 10-second HLS segments by [`cosmoscast-ingest`](https://github.com/cosmodtn/cosmocast-ingest). Each segment is wrapped in a **bundle** — a self-describing unit with a content ID, sequence number, priority, TTL, and a BLAKE3 integrity hash.
+Content is chunked into 10-second HLS segments by [`cosmoscast-ingest`](https://github.com/CosmoDTN/cosmocast-ingest). Each segment is wrapped in a **bundle** — a self-describing unit with a content ID, sequence number, priority, TTL, and a BLAKE3 integrity hash.
 
 `cosmosd` uses **epidemic routing**: when two nodes connect, they exchange bundle manifests and transfer what the other is missing. Bundles propagate through the network hop-by-hop until they reach every reachable node.
 
@@ -29,10 +29,19 @@ POST /ingest           epidemic sync         GET /play/...
 
 ## Install
 
+### Homebrew (recommended)
+
+```bash
+brew tap CosmoDTN/tap
+brew install cosmosd
+```
+
+### From source
+
 **Prerequisites:** Rust 1.78+
 
 ```bash
-git clone https://github.com/cosmodtn/cosmosd
+git clone https://github.com/CosmoDTN/cosmosd
 cd cosmosd
 cargo build --release
 # Binary at: target/release/cosmosd

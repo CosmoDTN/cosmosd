@@ -161,17 +161,6 @@ Community transports:
 
 ---
 
-## CosmoDTN ecosystem
-
-| Repo | Language | Purpose |
-|------|----------|---------|
-| [`cosmodtn/cosmosd`](https://github.com/cosmodtn/cosmosd) | Rust | This repo — core daemon |
-| [`cosmodtn/cosmocast-ingest`](https://github.com/cosmodtn/cosmocast-ingest) | Python | yt-dlp + ffmpeg HLS pipeline |
-| [`cosmodtn/cosmocast-sdk`](https://github.com/cosmodtn/cosmocast-sdk) | Dart / Python / JS | App SDK over the local HTTP API |
-| [`cosmodtn/transport-lora`](https://github.com/cosmodtn/transport-lora) | Rust | LoRa convergence layer |
-| [`cosmodtn/transport-reticulum`](https://github.com/cosmodtn/transport-reticulum) | Python/Rust | Reticulum convergence layer |
-
----
 
 ## Protocol
 

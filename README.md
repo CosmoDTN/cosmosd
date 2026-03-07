@@ -156,8 +156,8 @@ cosmosd
 See [`TRANSPORT.md`](TRANSPORT.md) for the interface, bundle framing spec, and bandwidth guidance per medium (TCP, Bluetooth, LoRa, ham radio, USB sneakernet).
 
 Community transports:
-- [`cosmodtn/transport-reticulum`](https://github.com/cosmodtn/transport-reticulum) _(planned)_
-- [`cosmodtn/transport-lora`](https://github.com/cosmodtn/transport-lora) _(planned)_
+- [`cosmodtn/transport-reticulum`] _(planned)_
+- [`cosmodtn/transport-lora`] _(planned)_
 
 ---
 

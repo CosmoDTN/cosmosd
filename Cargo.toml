@@ -1,6 +1,6 @@
 [package]
 name = "cosmosd"
-version = "0.2.0-alpha"
+version = "0.1.0"
 edition = "2021"
 description = "Delay-tolerant streaming daemon — stream across the void"
 license = "MIT"

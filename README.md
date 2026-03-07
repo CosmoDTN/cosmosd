@@ -29,22 +29,73 @@ POST /ingest           epidemic sync         GET /play/...
 
 ## Install
 
-### Homebrew (recommended)
+### macOS — Homebrew (recommended)
 
 ```bash
 brew tap CosmoDTN/tap
 brew install cosmosd
 ```
 
-### cargo install (Linux / Windows / macOS)
+ffmpeg (required for `cosmosd ingest`):
+```bash
+brew install ffmpeg
+```
 
+---
+
+### Ubuntu / Debian
+
+Install system dependencies first:
+```bash
+sudo apt update
+sudo apt install pkg-config libssl-dev ffmpeg
+```
+
+Install Rust (if not already installed):
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+Install cosmosd:
 ```bash
 cargo install cosmosd
 ```
 
-### From source
+---
 
-**Prerequisites:** Rust 1.78+
+### Other Linux (Fedora, Arch, Alpine)
+
+```bash
+# Fedora / RHEL
+sudo dnf install pkg-config openssl-devel ffmpeg
+
+# Arch
+sudo pacman -S pkg-config openssl ffmpeg
+
+# Alpine
+sudo apk add pkgconfig openssl-dev ffmpeg
+```
+
+Then:
+```bash
+cargo install cosmosd
+```
+
+---
+
+### Windows
+
+Install Rust from [rustup.rs](https://rustup.rs), then:
+```bash
+cargo install cosmosd
+```
+
+For `cosmosd ingest`, install [ffmpeg for Windows](https://ffmpeg.org/download.html) and add it to your PATH.
+
+---
+
+### From source
 
 ```bash
 git clone https://github.com/CosmoDTN/cosmosd
@@ -60,6 +111,13 @@ cargo build --release
 ```bash
 # Start the daemon (defaults: HTTP on 7777, relay on 7778)
 cosmosd serve
+
+# Ingest a local video file (requires ffmpeg + daemon running)
+cosmosd ingest /path/to/movie.mkv
+cosmosd ingest /path/to/movie.mkv --title "Interstellar"
+cosmosd ingest /path/to/movie.mkv --daemon http://10.2.0.119:7777
+
+# Start daemon
 
 # Custom ports
 cosmosd serve --port 8888 --relay-port 8889

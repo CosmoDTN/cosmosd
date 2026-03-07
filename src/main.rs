@@ -267,6 +267,8 @@ async fn ingest_file(
     let status = std::process::Command::new("ffmpeg")
         .args([
             "-y", "-i", file.to_str().unwrap(),
+            "-map", "0:v:0",   // first video stream only
+            "-map", "0:a:0",   // first audio stream only
             "-codec", "copy",
             "-hls_time", "10",
             "-hls_list_size", "0",

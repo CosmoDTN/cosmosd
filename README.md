@@ -1,3 +1,5 @@
+> **Disclaimer:** This project was largely written with AI assistance. Most of the code has not been formally reviewed, tested in production, or audited for correctness. Use at your own risk. Contributions, reviews, and bug reports are very welcome.
+
 # cosmosd
 
 **Delay-tolerant streaming daemon — stream across the void.**
@@ -165,12 +167,6 @@ Community transports:
 ## Protocol
 
 The bundle format is a working subset of [IETF BPv7 (RFC 9171)](https://www.rfc-editor.org/rfc/rfc9171) extended with streaming-specific fields (sequence number, priority, HLS MIME type). Full BPv7 wire compatibility is a future goal.
-
-Versioned protocol specs live in `docs/spec/`:
-- `spec-001-bundle-format.md` — bundle structure and fields
-- `spec-002-convergence-layer.md` — transport plugin interface
-- `spec-003-routing.md` — epidemic routing and contact scheduling
-- `spec-004-hls-mapping.md` — HLS segment to bundle mapping
 
 ---
 

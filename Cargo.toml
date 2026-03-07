@@ -1,0 +1,52 @@
+[package]
+name = "cosmosd"
+version = "0.1.0"
+edition = "2021"
+description = "Delay-tolerant streaming daemon — stream across the void"
+license = "MIT"
+repository = "https://github.com/cosmoscast/cosmosd"
+
+[[bin]]
+name = "cosmosd"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP API (local REST for SDK + ingest)
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Storage (content-addressed bundle store)
+sled = "0.34"
+
+# Crypto (bundle content addressing)
+blake3 = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Time + IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+hostname = "0.3"
+mdns-sd = "0.10"
+async-trait = "0.1"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

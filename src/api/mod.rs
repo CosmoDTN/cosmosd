@@ -3,7 +3,7 @@
 //! All endpoints bind to localhost only. No authentication needed
 //! since this is a local daemon API (not exposed to the network).
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -22,6 +22,8 @@ use crate::{
     store::BundleStore,
 };
 
+mod playlist;
+
 // === App state ===
 
 #[derive(Clone)]
@@ -29,6 +31,8 @@ pub struct ApiState {
     pub store: Arc<BundleStore>,
     pub node_id: String,
     pub peers: Arc<PeerManager>,
+    /// How far behind live the playlist edge sits (`serve --delay`).
+    pub delay: Duration,
 }
 
 // === Error type ===
@@ -102,30 +106,37 @@ async fn hls_segment_handler(
     if !bundle.verify() {
         return Ok((StatusCode::INTERNAL_SERVER_ERROR, "Integrity check failed").into_response());
     }
-    Ok(([("Content-Type", "video/mp2t")], bundle.payload).into_response())
+    Ok((
+        [
+            ("Content-Type", "video/mp2t".to_string()),
+            ("x-cosmosd-created-at", bundle.created_at.to_rfc3339()),
+        ],
+        bundle.payload,
+    )
+        .into_response())
 }
 
 async fn serve_playlist(state: ApiState, content_id: String) -> Result<Response, ApiError> {
-    let bundles = state.store.list_meta(&content_id)?;
-    if bundles.is_empty() {
+    let metas = state.store.list_meta(&content_id)?;
+    if metas.is_empty() {
         return Ok((StatusCode::NOT_FOUND, "Content not found").into_response());
     }
-    let mut m3u8 = String::from(
-        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n",
-    );
-    for bundle in &bundles {
-        m3u8.push_str(&format!(
-            "#EXTINF:10.0,\n/segment/{}/{}\n",
-            content_id, bundle.sequence
-        ));
-    }
-    // NOTE: no EXT-X-ENDLIST for live — added only when all segments are VOD
-    if bundles.iter().all(|b| b.priority == Priority::Vod) {
-        m3u8.push_str("#EXT-X-ENDLIST\n");
-    }
-    Ok(([("Content-Type", "application/x-mpegURL")], m3u8).into_response())
+    let body = if metas.iter().all(|m| m.priority == Priority::Vod) {
+        playlist::vod_playlist(&content_id, &metas)
+    } else {
+        match playlist::live_playlist(&content_id, &metas, chrono::Utc::now(), state.delay) {
+            Some(p) => p,
+            None => {
+                return Ok((
+                    StatusCode::NOT_FOUND,
+                    "Buffering: nothing old enough to play yet",
+                )
+                    .into_response());
+            }
+        }
+    };
+    Ok(([("Content-Type", "application/x-mpegURL")], body).into_response())
 }
-
 
 /// List all known peers and their sync status.
 async fn list_peers(State(state): State<ApiState>) -> impl IntoResponse {

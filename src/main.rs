@@ -224,7 +224,7 @@ async fn serve(
     }
 
     // 8. HTTP API server
-    let state = ApiState { store, node_id, peers: peer_manager };
+    let state = ApiState { store, node_id, peers: peer_manager, delay: std::time::Duration::from_secs(delay) };
     let app = api::router(state);
     let addr = format!("{}:{}", bind, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

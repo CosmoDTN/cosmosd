@@ -75,13 +75,35 @@ pub async fn ingest_live(
     info!("Daemon:     {}", daemon);
     info!("Max rate:   {} kbps, first sequence {}", max_kbps, sequence);
 
+    // Dropping `run` on either signal kills ffmpeg (kill_on_drop) and
+    // removes its tempdir.
+    let terminate = terminate_signal()?;
     tokio::select! {
         r = run(&input, &content_id, &title, &daemon, max_kbps, &client, &mut sequence) => r,
         _ = tokio::signal::ctrl_c() => {
-            info!("Stopping live ingest");
+            info!("Stopping live ingest (SIGINT)");
+            Ok(())
+        }
+        _ = terminate => {
+            info!("Stopping live ingest (SIGTERM)");
             Ok(())
         }
     }
+}
+
+/// Resolves on SIGTERM; never on platforms without it.
+#[cfg(unix)]
+fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
+    Ok(async move {
+        term.recv().await;
+    })
+}
+
+#[cfg(not(unix))]
+fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
+    Ok(std::future::pending())
 }
 
 /// Run ffmpeg and forward its segments, restarting forever. Each run's

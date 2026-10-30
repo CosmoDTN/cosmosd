@@ -181,7 +181,7 @@ There are three roles:
   `ingest --live` reads any URL ffmpeg can (HLS, RTMP, SRT, UDP) and re-encodes
   it to 720p H.264/AAC capped at `--max-bitrate` (default 1200 kbps total), in
   10-second segments pushed as soon as each one closes. It restarts ffmpeg if
-  the source drops, and runs until Ctrl-C.
+  the source drops, and runs until Ctrl-C or SIGTERM.
 
   Run the relay on **port 443**: plain TCP on 443 gets through many in-flight
   networks that block odd ports. Networks that proxy or inspect HTTPS still

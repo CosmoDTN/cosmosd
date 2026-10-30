@@ -49,7 +49,7 @@ PIDS=()
 INGEST_PID=""
 cleanup() {
     trap - EXIT INT TERM
-    # ingest stops its ffmpeg child only on SIGINT; SIGTERM would orphan it.
+    # ingest stops its ffmpeg child and removes its tempdir on SIGINT or SIGTERM.
     if [ -n "$INGEST_PID" ] && kill -0 "$INGEST_PID" 2>/dev/null; then
         kill -INT "$INGEST_PID" 2>/dev/null || true
         for _ in 1 2 3 4 5; do kill -0 "$INGEST_PID" 2>/dev/null || break; sleep 1; done
@@ -166,7 +166,8 @@ sleep 1 # let tee flush
 LOG="$DIR/play.log"
 [ "$PLAY_STATUS" -eq 0 ] || fail "playcheck exited with status $PLAY_STATUS"
 grep -q '^summary ' "$LOG" || fail "no summary line in play.log"
-grep -q ' start seq=' "$LOG" || fail "playback never started"
+# Anchored so `stall start seq=` can't count as playback starting.
+grep -qE '^t=[0-9.]+ start seq=' "$LOG" || fail "playback never started"
 
 # Event lines: t=<secs> <event...> seq=<n> lag=<secs>
 # Count stall starts with lo <= t <= hi, or lo <= t < hi when $3 is "open".

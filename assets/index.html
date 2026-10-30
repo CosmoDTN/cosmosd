@@ -26,15 +26,19 @@ li button[aria-current="true"] { border-color:var(--acc); border-width:2px; }
 <script src="/hls.min.js"></script>
 <script>
 var v = document.getElementById('v'), msg = document.getElementById('msg'), list = document.getElementById('list');
-var hls = null, timer = null;
+var hls = null, timer = null, gen = 0;
 
 function play(id) {
+  var my = ++gen;
   clearTimeout(timer);
   if (hls) { hls.destroy(); hls = null; }
+  v.pause(); v.removeAttribute('src'); v.load();
   var url = '/play/' + encodeURIComponent(id);
   fetch(url).then(function (r) {
+    if (my !== gen) return;
     if (r.status === 404) {
       return r.text().then(function (t) {
+        if (my !== gen) return;
         msg.textContent = t + ' (retrying)';
         timer = setTimeout(function () { play(id); }, 5000);
       });
@@ -53,6 +57,7 @@ function play(id) {
     }
     v.play().catch(function () {});
   }).catch(function () {
+    if (my !== gen) return;
     msg.textContent = 'Cannot reach the node (retrying)';
     timer = setTimeout(function () { play(id); }, 5000);
   });

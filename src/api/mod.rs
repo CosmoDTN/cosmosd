@@ -356,6 +356,7 @@ mod tests {
         assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
         let body = body_string(res).await;
         assert!(body.contains("<video") && body.contains("/hls.min.js") && !body.contains("https://"));
+        assert!(body.contains("++gen"), "play() needs a generation guard against stale responses");
     }
 
     #[tokio::test]

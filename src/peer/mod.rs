@@ -4,7 +4,8 @@
 //! epidemic router. After a success a peer is next tried one sync interval
 //! later; after a failure it backs off 1 s, 2 s, 4 s, 8 s, capped at 15 s,
 //! so a link that drops is picked up again within seconds.
-//! Peers can be added via CLI flag (--peer) or the HTTP API at runtime.
+//! Peers can be added via CLI flag (--peer) or the HTTP API at runtime, and,
+//! unless discovery is off, by connecting to us.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,6 +64,21 @@ impl PeerInfo {
     }
 }
 
+/// Record an incoming session from the peer relay at `relay_addr`. A known
+/// peer is marked seen; an unknown one is added only if `register` is set.
+///
+/// With discovery off (the ground node) it isn't: a gateway behind plane
+/// Wi-Fi can't be dialed back, and on one machine dialing back would hand the
+/// gateway a direct route to the ground that skips the satellite link.
+fn note_incoming(map: &mut HashMap<String, PeerInfo>, relay_addr: String, register: bool) {
+    if register {
+        map.entry(relay_addr.clone()).or_insert_with(|| PeerInfo::new(relay_addr.clone()));
+    }
+    if let Some(peer) = map.get_mut(&relay_addr) {
+        peer.last_seen = Some(Utc::now());
+    }
+}
+
 // === Peer manager ===
 
 pub struct PeerManager {
@@ -70,6 +86,8 @@ pub struct PeerManager {
     router: Arc<EpidemicRouter>,
     auth: Arc<RelayAuth>,
     sync_interval: Duration,
+    /// Add peers that connect to us (off with `--no-discovery`).
+    register_incoming: bool,
 }
 
 impl PeerManager {
@@ -88,7 +106,14 @@ impl PeerManager {
             router,
             auth,
             sync_interval,
+            register_incoming: true,
         }
+    }
+
+    /// Whether peers that connect to us are added to the peer list.
+    pub fn with_incoming_registration(mut self, on: bool) -> Self {
+        self.register_incoming = on;
+        self
     }
 
     /// Add a peer at runtime (called from HTTP API or discovery).
@@ -172,6 +197,7 @@ impl PeerManager {
             let router = self.router.clone();
             let peers = self.peers.clone();
             let auth = self.auth.clone();
+            let register = self.register_incoming;
 
             tokio::spawn(async move {
                 if let Err(e) = auth.verify_incoming(&mut stream).await {
@@ -180,13 +206,9 @@ impl PeerManager {
                 }
                 match router.handle_incoming(stream).await {
                     Ok(stats) => {
-                        // Register peer if not already known, at the relay port it advertised
+                        // At the relay port it advertised
                         let relay_addr = format!("{}:{}", peer_addr.ip(), stats.peer_relay_port);
-                        let mut map = peers.write().await;
-                        let peer = map
-                            .entry(relay_addr.clone())
-                            .or_insert_with(|| PeerInfo::new(relay_addr));
-                        peer.last_seen = Some(Utc::now());
+                        note_incoming(&mut *peers.write().await, relay_addr, register);
                         info!("Served {} bundles to {}", stats.sent, peer_addr);
                     }
                     Err(e) => {
@@ -216,6 +238,23 @@ mod tests {
         assert!(p.due(now));
         p.syncing = true;
         assert!(!p.due(now + chrono::Duration::hours(1)));
+    }
+
+    #[test]
+    fn incoming_peer_registered_only_when_discovering() {
+        let mut map = HashMap::new();
+        note_incoming(&mut map, "127.0.0.1:17778".into(), false);
+        assert!(map.is_empty(), "a --no-discovery node must not dial back whoever dialed it");
+        note_incoming(&mut map, "127.0.0.1:27778".into(), true);
+        assert!(map["127.0.0.1:27778"].last_seen.is_some());
+    }
+
+    #[test]
+    fn known_incoming_peer_is_seen_even_without_discovery() {
+        let mut map = HashMap::new();
+        map.insert("10.0.0.2:7778".to_string(), PeerInfo::new("10.0.0.2:7778".into()));
+        note_incoming(&mut map, "10.0.0.2:7778".into(), false);
+        assert!(map["10.0.0.2:7778"].last_seen.is_some());
     }
 
     #[test]

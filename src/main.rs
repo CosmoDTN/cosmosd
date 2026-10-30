@@ -76,7 +76,8 @@ enum Command {
         #[arg(long)]
         relay_token: Option<String>,
 
-        /// Disable mDNS peer discovery (useful in controlled environments).
+        /// Disable peer discovery: no mDNS, and peers that connect to us are not
+        /// dialed back. Only --peer and POST /peers peers are synced with.
         #[arg(long, default_value = "false")]
         no_discovery: bool,
 
@@ -200,7 +201,8 @@ async fn serve(
         relay_auth,
         initial_peers,
         std::time::Duration::from_secs(sync_interval),
-    ));
+    )
+    .with_incoming_registration(!no_discovery));
 
     // 4. Background: reap expired bundles every 5 minutes
     {

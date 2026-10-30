@@ -145,8 +145,77 @@ All options:
 | `--store` | `.cosmosd/store` | Bundle store directory |
 | `--node-id` | hostname | Human-readable node identifier |
 | `--relay-token` | — | Shared secret; peers must supply the same token |
-| `--no-discovery` | false | Disable mDNS auto-discovery |
+| `--no-discovery` | false | Disable discovery: no mDNS, and peers that connect in are not dialed back |
 | `--bind` | `127.0.0.1` | HTTP API bind address (`0.0.0.0` to expose on all interfaces) |
+| `--delay` | `120` | Seconds live playlists sit behind the newest segment |
+| `--sync-interval` | `5` | Seconds between syncs with a healthy peer |
+
+---
+
+## Live over a dropping link
+
+cosmosd can carry a live stream onto a plane over satellite Wi-Fi, where the
+link blinks for seconds and drops for minutes, and spread it around the cabin.
+There are three roles:
+
+- **Ground node**, on a machine with good internet. It transcodes a live source
+  and holds the segments. The gateway dials in to it, so it needs a reachable
+  relay port and a token:
+
+  ```bash
+  cosmosd serve --relay-port 443 --relay-token "$SECRET" --no-discovery
+  cosmosd ingest --live <stream URL> --content-id match --title "The match"
+  ```
+
+  `ingest --live` reads any URL ffmpeg can (HLS, RTMP, SRT, UDP) and re-encodes
+  it to 720p H.264/AAC capped at `--max-bitrate` (default 1200 kbps total), in
+  10-second segments pushed as soon as each one closes. It restarts ffmpeg if
+  the source drops, and runs until Ctrl-C.
+
+  Run the relay on **port 443**: plain TCP on 443 gets through many in-flight
+  networks that block odd ports. Networks that proxy or inspect HTTPS still
+  block it. On Linux, binding 443 needs root or
+  `setcap cap_net_bind_service=+ep`; or forward 443 to the default 7778.
+
+- **Gateway**, a laptop on the plane's paid Wi-Fi. It always dials out to the
+  ground node, never the reverse, and announces itself on the cabin LAN by mDNS:
+
+  ```bash
+  cosmosd serve --peer ground.example.com:443 --relay-token "$SECRET"
+  ```
+
+- **Cabin nodes**, other laptops on the same cabin LAN (a travel router you
+  bring, since plane Wi-Fi isolates clients). They find the gateway by mDNS and
+  serve the player to phones:
+
+  ```bash
+  cosmosd serve --bind 0.0.0.0
+  # watch: http://<laptop>:7777/play/match in Safari, VLC or ffplay
+  ```
+
+Playback is time-shifted, not buffered: `/play/<id>` lists only segments at
+least `--delay` seconds old (default 120), so everything newer is buffer that
+rides out link drops. A drop shorter than the delay is invisible to viewers.
+After a longer outage playback stalls, then jumps to the live edge minus the
+delay when the link returns; the gateway pulls that window first. A bigger
+`--delay` survives longer outages (up to the 30-minute live TTL).
+
+### Try it on one machine
+
+```bash
+scripts/demo-inflight.sh
+```
+
+Needs ffmpeg and a Rust toolchain, and takes about 17 minutes. It runs an ffmpeg
+test pattern into a ground node, a gateway that pulls it through `linksim` (a
+3 Mbps, 600 ms round-trip proxy, `examples/linksim.rs`), and a cabin node that
+finds the gateway by mDNS. A headless player (`examples/playcheck.rs`) watches
+the cabin while the script cuts the link for 30 seconds, then for 5 minutes.
+It checks that the short cut causes no stall, the long one does, and playback
+ends about 2 minutes behind live, then prints `DEMO PASS` or `DEMO FAIL: <why>`.
+Watch along with `ffplay http://127.0.0.1:37777/play/demo`; logs are kept in the
+temp directory it prints. If mDNS can't work on your machine,
+`DEMO_CABIN_PEER=1` gives the cabin an explicit `--peer` to the gateway instead.
 
 ---
 

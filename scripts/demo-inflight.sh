@@ -42,6 +42,13 @@ STALL_FROM=$(sc 420); STALL_TO=$(sc 780)
 LAG_MIN=$(sc 110); LAG_MAX=$(sc 180)
 
 command -v ffmpeg >/dev/null || fail "ffmpeg not found (brew install ffmpeg)"
+# cargo may be installed but not on PATH (Homebrew's keg-only rustup, rustup.rs).
+if ! command -v cargo >/dev/null; then
+    for d in /opt/homebrew/opt/rustup/bin "$HOME/.cargo/bin"; do
+        if [ -x "$d/cargo" ]; then export PATH="$d:$PATH"; break; fi
+    done
+fi
+command -v cargo >/dev/null || fail "cargo not found (install Rust: brew install rustup)"
 
 # === Cleanup ===
 
@@ -54,7 +61,9 @@ cleanup() {
         kill -INT "$INGEST_PID" 2>/dev/null || true
         for _ in 1 2 3 4 5; do kill -0 "$INGEST_PID" 2>/dev/null || break; sleep 1; done
     fi
-    for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+    # bash 3.2 with `set -u` treats an empty array as unbound: guard it for
+    # failures before anything was started.
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill "$pid" 2>/dev/null || true; done
     wait 2>/dev/null || true
     say "logs in $DIR"
 }

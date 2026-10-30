@@ -57,63 +57,67 @@ async fn wait_uncut(cut: &mut watch::Receiver<bool>) -> bool {
 // === Forwarding ===
 
 /// Read chunks, pace them, and stamp each with its delivery time.
+/// Ok on EOF (dropping `tx` lets the writer drain and finish).
 async fn read_side(
     mut src: OwnedReadHalf,
     tx: mpsc::UnboundedSender<(Instant, Vec<u8>)>,
     rate_kbps: u32,
     latency: Duration,
     mut cut: watch::Receiver<bool>,
-) {
+) -> std::io::Result<()> {
+    let gone = || std::io::Error::other("cut controller gone");
     let mut buf = vec![0u8; CHUNK];
     loop {
         if !wait_uncut(&mut cut).await {
-            return;
+            return Err(gone());
         }
-        let n = match src.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        };
+        let n = src.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
         // A cut that began during the read holds the chunk until restore.
         if !wait_uncut(&mut cut).await {
-            return;
+            return Err(gone());
         }
         tokio::time::sleep(send_delay(n, rate_kbps)).await;
         if tx.send((Instant::now() + latency, buf[..n].to_vec())).is_err() {
-            return;
+            return Err(gone());
         }
     }
 }
 
 /// Write chunks once their delivery time has come, in order, never while cut.
+/// After the queue is drained (reader hit EOF) the FIN is propagated.
 async fn write_side(
     mut dst: OwnedWriteHalf,
     mut rx: mpsc::UnboundedReceiver<(Instant, Vec<u8>)>,
     mut cut: watch::Receiver<bool>,
-) {
+) -> std::io::Result<()> {
     while let Some((deliver_at, chunk)) = rx.recv().await {
         tokio::time::sleep_until(deliver_at).await;
         if !wait_uncut(&mut cut).await {
-            return;
+            return Err(std::io::Error::other("cut controller gone"));
         }
-        if dst.write_all(&chunk).await.is_err() {
-            return;
-        }
+        dst.write_all(&chunk).await?;
     }
-    let _ = dst.shutdown().await;
+    dst.shutdown().await
 }
 
-/// One direction: reader and writer tasks joined by an ordered queue.
+/// One direction: reader and writer joined by an ordered queue. No spawned
+/// tasks, so dropping this future stops both. An error in either ends it.
 async fn pipe(
     src: OwnedReadHalf,
     dst: OwnedWriteHalf,
     rate_kbps: u32,
     latency: Duration,
     cut: watch::Receiver<bool>,
-) {
+) -> std::io::Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let reader = tokio::spawn(read_side(src, tx, rate_kbps, latency, cut.clone()));
-    write_side(dst, rx, cut).await;
-    reader.abort();
+    tokio::try_join!(
+        read_side(src, tx, rate_kbps, latency, cut.clone()),
+        write_side(dst, rx, cut)
+    )
+    .map(|_| ())
 }
 
 async fn handle(
@@ -136,13 +140,12 @@ async fn handle(
     };
     let (cr, cw) = client.into_split();
     let (sr, sw) = server.into_split();
-    let up = pipe(cr, sw, rate_kbps, latency, cut.clone());
-    let down = pipe(sr, cw, rate_kbps, latency, cut);
-    // When either direction ends, drop the other so both sockets close.
-    tokio::select! {
-        _ = up => {}
-        _ = down => {}
-    }
+    // Each direction ends on EOF (FIN propagated); the connection is done
+    // when both have, or as soon as either fails, which drops both.
+    let _ = tokio::try_join!(
+        pipe(cr, sw, rate_kbps, latency, cut.clone()),
+        pipe(sr, cw, rate_kbps, latency, cut)
+    );
 }
 
 #[tokio::main]
@@ -181,5 +184,40 @@ mod tests {
     fn send_delay_matches_rate() {
         assert_eq!(send_delay(16_000, 3000).as_micros(), 42_666);
         assert_eq!(send_delay(0, 3000), Duration::ZERO);
+    }
+
+    /// A client that sends a request and half-closes still gets the whole
+    /// response, in order, then EOF.
+    #[tokio::test]
+    async fn half_close_keeps_response() {
+        let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+
+        // Upstream: read the request to EOF, then reply with it and close.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            let mut req = Vec::new();
+            s.read_to_end(&mut req).await.unwrap();
+            s.write_all(&req).await.unwrap();
+        });
+
+        let (_cut_tx, cut_rx) = watch::channel(false);
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (c, _) = proxy.accept().await.unwrap();
+            handle(c, up_addr, 1_000_000, Duration::from_millis(5), cut_rx).await;
+        });
+
+        let mut c = TcpStream::connect(proxy_addr).await.unwrap();
+        c.write_all(&payload).await.unwrap();
+        c.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut got))
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(got, payload);
     }
 }

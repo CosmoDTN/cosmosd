@@ -142,13 +142,11 @@ impl Bundle {
     }
 
     /// The content stream this bundle belongs to (the id before the last `/`).
-    #[allow(dead_code)] // used by the router in a later task
     pub fn content_id(&self) -> &str {
         self.id.as_str().rsplit_once('/').map_or(self.id.as_str(), |(c, _)| c)
     }
 
     /// Routing fields without the payload.
-    #[allow(dead_code)] // used by the router in a later task
     pub fn meta(&self) -> BundleMeta {
         BundleMeta {
             id: self.id.0.clone(),
@@ -191,7 +189,6 @@ pub struct BundleMeta {
 
 impl BundleMeta {
     /// Returns true if the bundle has not yet expired.
-    #[allow(dead_code)] // used by the router from Task 4
     pub fn is_valid(&self) -> bool {
         Utc::now() < self.expires_at
     }

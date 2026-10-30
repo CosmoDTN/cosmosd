@@ -106,7 +106,7 @@ async fn hls_segment_handler(
 }
 
 async fn serve_playlist(state: ApiState, content_id: String) -> Result<Response, ApiError> {
-    let bundles = state.store.list_content(&content_id)?;
+    let bundles = state.store.list_meta(&content_id)?;
     if bundles.is_empty() {
         return Ok((StatusCode::NOT_FOUND, "Content not found").into_response());
     }

@@ -24,13 +24,19 @@ fn parse_id(id: &str) -> Option<(&str, u32)> {
     Some((content, seq.parse().ok()?))
 }
 
-/// Order the bundles we lack so the ones a viewer needs soonest come first:
-/// the delay window (the newest `delay` of segments, ascending), then live
-/// backfill (newest first), then VOD ascending. Unparsable ids go last.
+/// What one sync session pulls, most urgent first.
+///
+/// If any live or near-live segments are missing from the delay window (the
+/// newest `delay` of segments), the session pulls only those, ascending.
+/// Otherwise it pulls live backfill (newest first), then VOD ascending, then
+/// unparsable ids.
 ///
 /// The window starts exactly `delay` behind the newest segment: after a long
 /// outage players rejoin at the oldest segment they find near the edge, so
 /// anything older pulled first would leave them further behind for good.
+/// Leaving backfill to later sessions keeps a long backlog from holding up
+/// live segments made while it transfers; sessions recur every few seconds,
+/// so backfill follows once the edge is caught up.
 pub fn pull_order(their: &[ManifestEntry], ours: &HashSet<String>, delay: Duration) -> Vec<String> {
     // Newest seq per live/near-live content, over everything they have.
     let mut newest: HashMap<&str, u32> = HashMap::new();
@@ -67,6 +73,9 @@ pub fn pull_order(their: &[ManifestEntry], ours: &HashSet<String>, delay: Durati
         ids.sort();
         out.extend(ids.into_iter().map(|(_, id)| id.to_string()));
     }
+    if !out.is_empty() {
+        return out;
+    }
     for mut ids in backfill.into_values() {
         ids.sort_by(|a, b| b.cmp(a));
         out.extend(ids.into_iter().map(|(_, id)| id.to_string()));
@@ -87,18 +96,29 @@ mod tests {
     fn vod(id: &str) -> ManifestEntry { ManifestEntry { id: id.into(), priority: Priority::Vod } }
 
     #[test]
-    fn live_window_first_then_backfill_then_vod() {
+    fn urgent_work_excludes_backfill_and_vod() {
         let mut their: Vec<_> = (0..100).map(|s| live(&format!("m/{:05}", s))).collect();
         their.push(vod("f/00001"));
         their.push(vod("f/00000"));
         let ours: HashSet<String> = (0..50).map(|s| format!("m/{:05}", s)).collect();
         let order = pull_order(&their, &ours, Duration::from_secs(120));
-        // newest 99, delay 12 segments -> urgent from 87
+        // newest 99, delay 12 segments -> urgent from 87; nothing else this session
         let expect_urgent: Vec<String> = (87..100).map(|s| format!("m/{:05}", s)).collect();
-        assert_eq!(&order[..13], &expect_urgent[..]);
-        assert_eq!(order[13], "m/00086");
-        assert_eq!(order[49], "m/00050");
-        assert_eq!(&order[50..], &["f/00000".to_string(), "f/00001".to_string()]);
+        assert_eq!(order, expect_urgent);
+    }
+
+    #[test]
+    fn no_urgent_work_pulls_backfill_then_vod() {
+        let mut their: Vec<_> = (0..100).map(|s| live(&format!("m/{:05}", s))).collect();
+        their.push(vod("f/00001"));
+        their.push(vod("f/00000"));
+        let ours: HashSet<String> = (0..30).chain(87..100).map(|s| format!("m/{:05}", s)).collect();
+        let order = pull_order(&their, &ours, Duration::from_secs(120));
+        // backfill 86 down to 30 (57 bundles), then VOD ascending
+        assert_eq!(order.len(), 59);
+        assert_eq!(order[0], "m/00086");
+        assert_eq!(order[56], "m/00030");
+        assert_eq!(&order[57..], &["f/00000".to_string(), "f/00001".to_string()]);
     }
 
     /// After an outage longer than the delay, a player rejoins at the oldest
@@ -111,7 +131,7 @@ mod tests {
         let order = pull_order(&their, &ours, Duration::from_secs(120));
         assert_eq!(order[0], "demo/00059"); // newest 71 minus 12 segments of delay
         assert_eq!(order[12], "demo/00071");
-        assert_eq!(order[13], "demo/00058");
+        assert_eq!(order.len(), 13, "backfill 40..58 waits for a session with no edge work");
     }
 
     #[test]

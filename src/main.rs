@@ -13,6 +13,9 @@
 mod api;
 mod auth;
 mod bundle;
+// Used by the store, router and API from Tasks 2/4 onward.
+#[allow(dead_code)]
+mod codec;
 mod discovery;
 mod peer;
 mod router;

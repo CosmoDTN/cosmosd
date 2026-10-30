@@ -54,6 +54,7 @@ struct PullRequest {
 // === Frame I/O (4-byte length prefix + payload) ===
 
 const MAX_FRAME: usize = 60 * 1024 * 1024; // 60 MB hard cap
+const READ_CHUNK: usize = 64 * 1024;
 
 async fn send_frame<S: AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Result<()> {
     let len = data.len() as u32;
@@ -63,21 +64,35 @@ async fn send_frame<S: AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Resul
     Ok(())
 }
 
-/// Read one frame, giving up after `FRAME_TIMEOUT` so a dead link cannot hang us.
-async fn recv_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
-    timeout(FRAME_TIMEOUT, async {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_FRAME {
-            bail!("Frame too large: {} bytes", len);
+/// Read exactly `buf.len()` bytes; every individual read must make progress
+/// within `FRAME_TIMEOUT` (an idle timeout, so a slow but live link is fine).
+async fn read_idle<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let end = buf.len().min(filled + READ_CHUNK);
+        let n = timeout(FRAME_TIMEOUT, stream.read(&mut buf[filled..end]))
+            .await
+            .map_err(|_| anyhow!("timed out: no bytes from peer for {:?}", FRAME_TIMEOUT))??;
+        if n == 0 {
+            bail!("connection closed mid-frame");
         }
-        let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
-        Ok(buf)
-    })
-    .await
-    .map_err(|_| anyhow!("timed out after {:?} waiting for a frame", FRAME_TIMEOUT))?
+        filled += n;
+    }
+    Ok(())
+}
+
+/// Read one frame. Gives up after `FRAME_TIMEOUT` of silence, not of total
+/// transfer time, so big bundles survive slow links and dead links still fail.
+async fn recv_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    read_idle(stream, &mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME {
+        bail!("Frame too large: {} bytes", len);
+    }
+    let mut buf = vec![0u8; len];
+    read_idle(stream, &mut buf).await?;
+    Ok(buf)
 }
 
 // === Sync stats ===
@@ -303,7 +318,27 @@ mod tests {
     async fn initiate_times_out_on_stalled_peer() {
         let gateway = router("gateway", 27778);
         let (a, _b) = tokio::io::duplex(1 << 16); // peer never answers, never closes
-        let res = gateway.initiate(a).await;
-        assert!(res.is_err());
+        let err = gateway.initiate(a).await.unwrap_err().to_string();
+        assert!(err.contains("timed out"), "{}", err);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_but_live_frame_is_received() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        let payload = vec![7u8; 500_000];
+        let sent = payload.clone();
+        tokio::spawn(async move {
+            let mut framed = (sent.len() as u32).to_be_bytes().to_vec();
+            framed.extend_from_slice(&sent);
+            for piece in framed.chunks(100_000) {
+                a.write_all(piece).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }
+            a
+        });
+        let start = tokio::time::Instant::now();
+        let got = recv_frame(&mut b).await.unwrap();
+        assert_eq!(got, payload);
+        assert!(start.elapsed() > FRAME_TIMEOUT);
     }
 }

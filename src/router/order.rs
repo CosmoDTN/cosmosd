@@ -25,8 +25,12 @@ fn parse_id(id: &str) -> Option<(&str, u32)> {
 }
 
 /// Order the bundles we lack so the ones a viewer needs soonest come first:
-/// the live window (newest segments, ascending), then live backfill (newest
-/// first), then VOD ascending. Unparsable ids go last.
+/// the delay window (the newest `delay` of segments, ascending), then live
+/// backfill (newest first), then VOD ascending. Unparsable ids go last.
+///
+/// The window starts exactly `delay` behind the newest segment: after a long
+/// outage players rejoin at the oldest segment they find near the edge, so
+/// anything older pulled first would leave them further behind for good.
 pub fn pull_order(their: &[ManifestEntry], ours: &HashSet<String>, delay: Duration) -> Vec<String> {
     // Newest seq per live/near-live content, over everything they have.
     let mut newest: HashMap<&str, u32> = HashMap::new();
@@ -36,7 +40,7 @@ pub fn pull_order(their: &[ManifestEntry], ours: &HashSet<String>, delay: Durati
             *n = (*n).max(seq);
         }
     }
-    let margin = delay.as_secs() as u32 / 10 + 6;
+    let window = delay.as_secs() as u32 / 10; // in 10 s segments
 
     // (priority, content) sorts Live before NearLive, then by content id.
     let mut urgent: BTreeMap<(Priority, &str), Vec<(u32, &str)>> = BTreeMap::new();
@@ -53,7 +57,7 @@ pub fn pull_order(their: &[ManifestEntry], ours: &HashSet<String>, delay: Durati
             vod.push((content, seq, &e.id));
             continue;
         }
-        let urgent_from = newest[content].saturating_sub(margin);
+        let urgent_from = newest[content].saturating_sub(window);
         let set = if seq >= urgent_from { &mut urgent } else { &mut backfill };
         set.entry((e.priority, content)).or_default().push((seq, &e.id));
     }
@@ -89,12 +93,25 @@ mod tests {
         their.push(vod("f/00000"));
         let ours: HashSet<String> = (0..50).map(|s| format!("m/{:05}", s)).collect();
         let order = pull_order(&their, &ours, Duration::from_secs(120));
-        // newest 99, delay 12 segments + 6 margin -> urgent from 81
-        let expect_urgent: Vec<String> = (81..100).map(|s| format!("m/{:05}", s)).collect();
-        assert_eq!(&order[..19], &expect_urgent[..]);
-        assert_eq!(order[19], "m/00080");
+        // newest 99, delay 12 segments -> urgent from 87
+        let expect_urgent: Vec<String> = (87..100).map(|s| format!("m/{:05}", s)).collect();
+        assert_eq!(&order[..13], &expect_urgent[..]);
+        assert_eq!(order[13], "m/00086");
         assert_eq!(order[49], "m/00050");
         assert_eq!(&order[50..], &["f/00000".to_string(), "f/00001".to_string()]);
+    }
+
+    /// After an outage longer than the delay, a player rejoins at the oldest
+    /// segment it finds near the edge, so the first one pulled must be the
+    /// one `delay` behind the newest, not older.
+    #[test]
+    fn long_outage_pulls_the_rejoin_point_first() {
+        let their: Vec<_> = (0..72).map(|s| live(&format!("demo/{:05}", s))).collect();
+        let ours: HashSet<String> = (0..40).map(|s| format!("demo/{:05}", s)).collect();
+        let order = pull_order(&their, &ours, Duration::from_secs(120));
+        assert_eq!(order[0], "demo/00059"); // newest 71 minus 12 segments of delay
+        assert_eq!(order[12], "demo/00071");
+        assert_eq!(order[13], "demo/00058");
     }
 
     #[test]

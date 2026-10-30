@@ -128,8 +128,11 @@ cosmosd serve --peer 192.168.1.5:7778 --peer 192.168.1.6:7778
 # Custom store path and node ID
 cosmosd serve --store /data/cosmosd --node-id iss-node-1
 
-# Require a shared secret for relay connections
+# Require a shared secret from peers that dial us
 cosmosd serve --relay-token my-secret
+
+# Present a peer's token when dialing it (token follows the first @)
+cosmosd serve --peer ground.example.com:443@their-secret
 
 # Disable mDNS auto-discovery (for controlled environments)
 cosmosd serve --no-discovery
@@ -141,10 +144,11 @@ All options:
 |------|---------|-------------|
 | `--port` | `7777` | HTTP API port (SDK and ingest connect here) |
 | `--relay-port` | `7778` | TCP relay port (peer-to-peer bundle sync) |
-| `--peer` | — | Known peer relay address; pass multiple times |
+| `--peer` | — | Known peer relay address, `host:port` or `host:port@token` (token after the first `@`, presented only to that peer); pass multiple times |
 | `--store` | `.cosmosd/store` | Bundle store directory |
 | `--node-id` | hostname | Human-readable node identifier |
-| `--relay-token` | — | Shared secret; peers must supply the same token |
+| `--relay-token` | — | Shared secret guarding our relay port; peers that dial us must present it. It is not sent to peers we dial |
+| `--open-relay` | false | Allow a relay with no `--relay-token` on a machine that has a public IPv4 address (otherwise `serve` refuses to start) |
 | `--no-discovery` | false | Disable discovery: no mDNS, and peers that connect in are not dialed back |
 | `--bind` | `127.0.0.1` | HTTP API bind address (`0.0.0.0` to expose on all interfaces) |
 | `--delay` | `120` | Seconds live playlists sit behind the newest segment |
@@ -178,10 +182,12 @@ There are three roles:
   `setcap cap_net_bind_service=+ep`; or forward 443 to the default 7778.
 
 - **Gateway**, a laptop on the plane's paid Wi-Fi. It always dials out to the
-  ground node, never the reverse, and announces itself on the cabin LAN by mDNS:
+  ground node, never the reverse, and announces itself on the cabin LAN by mDNS.
+  The ground's token rides on the `--peer` argument, so the gateway holds it
+  without demanding it from the cabin nodes that dial in:
 
   ```bash
-  cosmosd serve --peer ground.example.com:443 --relay-token "$SECRET"
+  cosmosd serve --peer "ground.example.com:443@$SECRET"
   ```
 
 - **Cabin nodes**, other laptops on the same cabin LAN (a travel router you

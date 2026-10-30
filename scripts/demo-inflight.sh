@@ -5,6 +5,9 @@
 #     ground relay <-- linksim (3 Mbps, 300 ms each way, cut twice) <-- gateway
 #     gateway <-- mDNS --> cabin <-- playcheck (headless player)
 #
+# The ground node requires a token; the gateway holds it (--peer addr@token)
+# and the cabin, which dials only the gateway, has none.
+#
 # The link is cut for 30 s, then for 5 minutes. The player must not stall
 # through the short cut, must stall in the long one, and must end up about
 # two minutes (--delay) behind live. Prints DEMO PASS or DEMO FAIL: <reason>.
@@ -94,6 +97,7 @@ PIDS+=($!)
 # === 3. Ground node + live ingest ===
 
 "$COSMOSD" serve --port 17777 --relay-port 17778 --node-id ground --no-discovery \
+    --relay-token demo-secret \
     --delay "$DELAY" --store "$DIR/ground" >"$DIR/ground.log" 2>&1 &
 PIDS+=($!)
 wait_http http://127.0.0.1:17777/health
@@ -110,7 +114,7 @@ PIDS+=($LINKSIM_PID)
 
 # === 5. Gateway (dials the ground through the link; mDNS on) ===
 
-"$COSMOSD" serve --port 27777 --relay-port 27778 --node-id gateway --peer 127.0.0.1:18778 \
+"$COSMOSD" serve --port 27777 --relay-port 27778 --node-id gateway --peer 127.0.0.1:18778@demo-secret \
     --delay "$DELAY" --store "$DIR/gateway" >"$DIR/gateway.log" 2>&1 &
 PIDS+=($!)
 

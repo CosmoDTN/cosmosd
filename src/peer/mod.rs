@@ -36,6 +36,9 @@ pub fn retry_delay(failed_attempts: u32, sync_interval: Duration) -> Duration {
 #[derive(Debug, Clone, Serialize)]
 pub struct PeerInfo {
     pub relay_addr: String,
+    /// Token we present when dialing this peer. Never serialized or logged.
+    #[serde(skip)]
+    pub token: Option<String>,
     pub last_seen: Option<DateTime<Utc>>,
     pub last_sync: Option<DateTime<Utc>>,
     pub bundles_received: usize,
@@ -49,6 +52,7 @@ impl PeerInfo {
     fn new(relay_addr: String) -> Self {
         PeerInfo {
             relay_addr,
+            token: None,
             last_seen: None,
             last_sync: None,
             bundles_received: 0,
@@ -94,12 +98,14 @@ impl PeerManager {
     pub fn new(
         router: Arc<EpidemicRouter>,
         auth: Arc<RelayAuth>,
-        initial_peers: Vec<String>,
+        initial_peers: Vec<(String, Option<String>)>,
         sync_interval: Duration,
     ) -> Self {
         let mut map = HashMap::new();
-        for addr in initial_peers {
-            map.insert(addr.clone(), PeerInfo::new(addr));
+        for (addr, token) in initial_peers {
+            let mut info = PeerInfo::new(addr.clone());
+            info.token = token;
+            map.insert(addr, info);
         }
         PeerManager {
             peers: Arc::new(RwLock::new(map)),
@@ -139,7 +145,7 @@ impl PeerManager {
             tick.tick().await;
 
             // Select and mark under one lock so two ticks never double-start a peer.
-            let due: Vec<String> = {
+            let due: Vec<(String, Option<String>)> = {
                 let now = Utc::now();
                 let mut peers = self.peers.write().await;
                 peers
@@ -147,19 +153,18 @@ impl PeerManager {
                     .filter(|p| p.due(now))
                     .map(|p| {
                         p.syncing = true;
-                        p.relay_addr.clone()
+                        (p.relay_addr.clone(), p.token.clone())
                     })
                     .collect()
             };
 
-            for addr in due {
+            for (addr, token) in due {
                 let router = self.router.clone();
                 let peers = self.peers.clone();
-                let auth = self.auth.clone();
                 let sync_interval = self.sync_interval;
 
                 tokio::spawn(async move {
-                    let result = router.sync_with_peer(&addr, auth).await;
+                    let result = router.sync_with_peer(&addr, token.as_deref()).await;
                     let now = Utc::now();
                     let mut map = peers.write().await;
                     if let Some(peer) = map.get_mut(&addr) {
@@ -255,6 +260,13 @@ mod tests {
         map.insert("10.0.0.2:7778".to_string(), PeerInfo::new("10.0.0.2:7778".into()));
         note_incoming(&mut map, "10.0.0.2:7778".into(), false);
         assert!(map["10.0.0.2:7778"].last_seen.is_some());
+    }
+
+    #[test]
+    fn peer_token_is_not_serialized() {
+        let mut p = PeerInfo::new("x:1".into());
+        p.token = Some("hunter2".into());
+        assert!(!serde_json::to_string(&p).unwrap().contains("hunter2"));
     }
 
     #[test]

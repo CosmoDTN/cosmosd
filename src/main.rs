@@ -59,7 +59,9 @@ enum Command {
         relay_port: u16,
 
         /// Known peers to sync with (relay addresses, e.g. 192.168.1.5:7778).
-        /// Pass multiple times: --peer A --peer B
+        /// Pass multiple times: --peer A --peer B.
+        /// A token follows the first `@` (host:port@token); it is presented
+        /// only to that peer.
         #[arg(long = "peer")]
         peers: Vec<String>,
 
@@ -71,8 +73,8 @@ enum Command {
         #[arg(long)]
         node_id: Option<String>,
 
-        /// Optional shared secret for relay authentication.
-        /// If set, peers must supply the same token to sync.
+        /// Optional shared secret guarding our relay port: peers that dial us
+        /// must present it. Tokens for peers we dial go in `--peer host:port@token`.
         #[arg(long)]
         relay_token: Option<String>,
 
@@ -80,6 +82,11 @@ enum Command {
         /// dialed back. Only --peer and POST /peers peers are synced with.
         #[arg(long, default_value = "false")]
         no_discovery: bool,
+
+        /// Run the relay without a --relay-token even if this machine has a
+        /// public IPv4 address.
+        #[arg(long, default_value = "false")]
+        open_relay: bool,
 
         /// Bind address for the HTTP API.
         /// Use 0.0.0.0 to expose the API on all interfaces (e.g. for remote access).
@@ -139,8 +146,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, bind, delay, sync_interval } => {
-            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, bind, delay, sync_interval).await?;
+        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval } => {
+            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval).await?;
         }
         Command::Ingest { file, live, content_id, title, daemon, priority, max_bitrate } => {
             match (file, live) {
@@ -166,6 +173,7 @@ async fn serve(
     initial_peers: Vec<String>,
     relay_token: Option<String>,
     no_discovery: bool,
+    open_relay: bool,
     bind: String,
     delay: u64,
     sync_interval: u64,
@@ -176,6 +184,8 @@ async fn serve(
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "cosmosd-node".to_string())
     });
+
+    auth::check_open_relay(relay_token.is_some(), open_relay)?;
 
     info!("CosmosD node:  {}", node_id);
     info!("Bundle store:  {}", store_path);
@@ -199,7 +209,7 @@ async fn serve(
     let peer_manager = Arc::new(PeerManager::new(
         epidemic_router,
         relay_auth,
-        initial_peers,
+        initial_peers.iter().map(|a| auth::parse_peer(a)).collect(),
         std::time::Duration::from_secs(sync_interval),
     )
     .with_incoming_registration(!no_discovery));

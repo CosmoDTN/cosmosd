@@ -23,7 +23,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::auth::RelayAuth;
+use crate::auth::authenticate_outgoing;
 use crate::bundle::Bundle;
 use crate::codec::{self, PROTOCOL_VERSION};
 use crate::store::BundleStore;
@@ -148,12 +148,12 @@ impl EpidemicRouter {
     /// Initiate a sync session with a remote peer.
     ///
     /// Called by the peer manager on a schedule for each known peer.
-    pub async fn sync_with_peer(&self, addr: &str, auth: Arc<RelayAuth>) -> Result<SyncStats> {
+    pub async fn sync_with_peer(&self, addr: &str, token: Option<&str>) -> Result<SyncStats> {
         debug!("Connecting to peer relay: {}", addr);
         let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| anyhow!("timed out connecting to {}", addr))??;
-        auth.authenticate_outgoing(&mut stream).await?;
+        authenticate_outgoing(&mut stream, token).await?;
         self.initiate(stream).await
     }
 

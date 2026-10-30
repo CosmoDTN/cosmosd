@@ -78,9 +78,13 @@ pub(crate) async fn push_segment(
         }))
         .send()
         .await
-        .with_context(|| format!("Failed to push segment {}", sequence))?
-        .error_for_status()
-        .with_context(|| format!("Daemon rejected segment {}", sequence))?;
+        .with_context(|| format!("Failed to push segment {}", sequence))?;
+    // Keep the daemon's reason (e.g. the 403 for a non-localhost ingest).
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Daemon rejected segment {}: {}: {}", sequence, status, body.trim());
+    }
     Ok(resp.json().await?)
 }
 
@@ -197,6 +201,20 @@ mod tests {
         assert_eq!(e[0].uri, "seg00000.ts");
         assert_eq!(e[0].duration_ms, 10_010);
         assert_eq!(e[1].duration_ms, 9_500);
+    }
+
+    #[tokio::test]
+    async fn push_segment_error_carries_the_daemon_body() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let app = Router::new().route("/ingest", post(|| async { (StatusCode::FORBIDDEN, "write routes are localhost-only") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daemon = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let err = push_segment(&client, &daemon, "m", "M", 0, "live", 10_000, b"ts").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("403") && msg.contains("write routes are localhost-only"), "{msg}");
     }
 
     #[test]

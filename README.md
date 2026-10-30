@@ -115,7 +115,9 @@ cosmosd serve
 # Ingest a local video file (requires ffmpeg + daemon running)
 cosmosd ingest /path/to/movie.mkv
 cosmosd ingest /path/to/movie.mkv --title "Interstellar"
-cosmosd ingest /path/to/movie.mkv --daemon http://10.2.0.119:7777
+cosmosd ingest /path/to/movie.mkv --daemon http://127.0.0.1:8888  # a daemon on another port
+# Ingest runs on the daemon's own host: POST /ingest answers only to localhost,
+# so a remote --daemon gets 403 Forbidden.
 
 # Start daemon
 
@@ -151,7 +153,7 @@ All options:
 | `--open-relay` | false | Allow a relay with no `--relay-token` with `--no-discovery` or on a machine that has a public IPv4 address (otherwise `serve` refuses to start) |
 | `--no-discovery` | false | Disable discovery: no mDNS, and peers that connect in are not dialed back. This is the ground role, so it needs `--relay-token` (or `--open-relay`) |
 | `--bind` | `127.0.0.1` | HTTP API bind address (`0.0.0.0` to expose on all interfaces) |
-| `--delay` | `120` | Seconds live playlists sit behind the newest segment |
+| `--delay` | `120` | Seconds the viewer plays behind live; also the window of newest segments a gateway pulls first. Use the same value on the gateway and cabin nodes |
 | `--sync-interval` | `5` | Seconds between syncs with a healthy peer |
 
 ---
@@ -170,6 +172,11 @@ There are three roles:
   cosmosd serve --relay-port 443 --relay-token "$SECRET" --no-discovery
   cosmosd ingest --live <stream URL> --content-id match --title "The match"
   ```
+
+  Always run the ground relay with a token. `serve` refuses an open relay on a
+  public IPv4 address, but NAT, port forwarding and containers can expose a
+  relay that has no public address of its own, so a `--no-discovery` node
+  refuses to start without `--relay-token` (or `--open-relay`).
 
   `ingest --live` reads any URL ffmpeg can (HLS, RTMP, SRT, UDP) and re-encodes
   it to 720p H.264/AAC capped at `--max-bitrate` (default 1200 kbps total), in
@@ -199,12 +206,22 @@ There are three roles:
   # watch: http://<laptop>:7777/play/match in Safari, VLC or ffplay
   ```
 
+  A phone on the cabin LAN opens `http://<laptop-ip>:7777/` (the cabin node's
+  `--port`) in its browser and picks a title: the player page and hls.js are
+  built into cosmosd, so it needs no app and no internet.
+
 Playback is time-shifted, not buffered: `/play/<id>` lists only segments at
 least `--delay` seconds old (default 120), so everything newer is buffer that
 rides out link drops. A drop shorter than the delay is invisible to viewers.
 After a longer outage playback stalls, then jumps to the live edge minus the
 delay when the link returns; the gateway pulls that window first. A bigger
-`--delay` survives longer outages (up to the 30-minute live TTL).
+`--delay` survives longer outages (up to the 30-minute live TTL). Set the same
+`--delay` on the gateway and the cabin nodes: the gateway's sets how much it
+pulls first, the cabin's how far behind live phones play.
+
+Sharing a paid in-flight Wi-Fi connection and redistributing a broadcast may
+break the airline's terms of service and the broadcaster's rights: check both
+before you use this.
 
 ### Try it on one machine
 
@@ -227,17 +244,22 @@ temp directory it prints. If mDNS can't work on your machine,
 
 ## HTTP API
 
-The API binds to `127.0.0.1` only — it is local-only by design.
+The API binds to `127.0.0.1` by default. `--bind 0.0.0.0` exposes the read
+routes (`GET`) to the network, so phones can play; the write routes
+(`POST /ingest`, `POST /peers`) answer only to localhost, whatever `--bind`
+says, and return 403 to anyone else.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/` | Phone player page: lists titles and plays them (hls.js built in, no internet needed) |
+| `GET` | `/hls.min.js` | The embedded hls.js used by the player page |
 | `GET` | `/health` | Node status, version |
 | `GET` | `/catalog` | List all stored content |
 | `GET` | `/play/:content_id` | HLS M3U8 playlist |
 | `GET` | `/segment/:content_id/:sequence` | Raw `.ts` segment bytes |
-| `POST` | `/ingest` | Add a bundle (used by cosmoscast-ingest) |
+| `POST` | `/ingest` | Add a bundle (used by `cosmosd ingest`; localhost only) |
 | `GET` | `/peers` | Connected peers and sync status |
-| `POST` | `/peers` | Add a peer at runtime |
+| `POST` | `/peers` | Add a peer at runtime (localhost only) |
 
 ### Example: ingest a segment
 
@@ -252,6 +274,7 @@ curl -s -X POST http://localhost:7777/ingest \
     \"sequence\": 1,
     \"mime_type\": \"video/mp2t\",
     \"priority\": \"vod\",
+    \"duration_ms\": 10000,
     \"payload_b64\": \"$PAYLOAD_B64\"
   }"
 ```

@@ -93,7 +93,9 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
 
-        /// Seconds of delay the link tolerates before a bundle is considered late.
+        /// Seconds the viewer plays behind live (live playlists list only
+        /// segments this old). Also the window of newest segments a gateway
+        /// pulls first. Use the same value on the gateway and cabin nodes.
         #[arg(long, default_value = "120")]
         delay: u64,
 

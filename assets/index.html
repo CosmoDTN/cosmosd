@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cosmosd</title>
+<style>
+:root { color-scheme: light dark; --bg:#f6f7f9; --fg:#14171a; --card:#fff; --mut:#6b7480; --acc:#2563eb; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1114; --fg:#e8eaed; --card:#1a1d21; --mut:#9aa3ad; --acc:#60a5fa; } }
+body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:17px/1.4 system-ui, sans-serif; }
+h1 { font-size:1.2rem; margin:0 0 12px; }
+video { width:100%; max-height:50vh; background:#000; border-radius:8px; }
+#msg { min-height:1.4em; margin:8px 0; color:var(--mut); }
+ul { list-style:none; margin:0; padding:0; }
+li button { width:100%; display:flex; justify-content:space-between; gap:12px; margin:0 0 8px; padding:14px; font:inherit;
+  color:var(--fg); background:var(--card); border:1px solid var(--mut); border-radius:8px; text-align:left; }
+li button[aria-current="true"] { border-color:var(--acc); border-width:2px; }
+.pri { color:var(--mut); font-size:.85em; }
+</style>
+</head>
+<body>
+<h1>cosmosd</h1>
+<video id="v" controls playsinline></video>
+<div id="msg" role="status"></div>
+<ul id="list"></ul>
+<script src="/hls.min.js"></script>
+<script>
+var v = document.getElementById('v'), msg = document.getElementById('msg'), list = document.getElementById('list');
+var hls = null, timer = null;
+
+function play(id) {
+  clearTimeout(timer);
+  if (hls) { hls.destroy(); hls = null; }
+  var url = '/play/' + encodeURIComponent(id);
+  fetch(url).then(function (r) {
+    if (r.status === 404) {
+      return r.text().then(function (t) {
+        msg.textContent = t + ' (retrying)';
+        timer = setTimeout(function () { play(id); }, 5000);
+      });
+    }
+    if (!r.ok) { msg.textContent = 'Error ' + r.status; return; }
+    msg.textContent = '';
+    if (v.canPlayType('application/vnd.apple.mpegurl')) {
+      v.src = url;
+    } else if (window.Hls && Hls.isSupported()) {
+      hls = new Hls();
+      hls.loadSource(url);
+      hls.attachMedia(v);
+    } else {
+      msg.textContent = 'This browser cannot play HLS.';
+      return;
+    }
+    v.play().catch(function () {});
+  }).catch(function () {
+    msg.textContent = 'Cannot reach the node (retrying)';
+    timer = setTimeout(function () { play(id); }, 5000);
+  });
+}
+
+function load() {
+  fetch('/catalog').then(function (r) { return r.json(); }).then(function (items) {
+    list.textContent = '';
+    if (!items.length) msg.textContent = 'Nothing here yet.';
+    items.forEach(function (c) {
+      var li = document.createElement('li'), b = document.createElement('button'), p = document.createElement('span');
+      b.textContent = c.title || c.content_id;
+      p.className = 'pri'; p.textContent = c.priority;
+      b.appendChild(p);
+      b.onclick = function () {
+        Array.prototype.forEach.call(list.querySelectorAll('button'), function (x) { x.removeAttribute('aria-current'); });
+        b.setAttribute('aria-current', 'true');
+        play(c.content_id);
+      };
+      li.appendChild(b); list.appendChild(li);
+    });
+  }).catch(function () { msg.textContent = 'Cannot load the catalog.'; });
+}
+load();
+</script>
+</body>
+</html>

@@ -9,7 +9,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{
     Router,
     extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -72,6 +72,8 @@ pub fn router(state: ApiState) -> Router {
         .route_layer(middleware::from_fn(localhost_only));
 
     Router::new()
+        .route("/", get(index_page))
+        .route("/hls.min.js", get(hls_js))
         .route("/health", get(health))
         .route("/catalog", get(catalog))
         .route("/play/:content_id", get(hls_playlist_handler))
@@ -79,6 +81,18 @@ pub fn router(state: ApiState) -> Router {
         .route("/peers", get(list_peers))
         .merge(writes)
         .with_state(state)
+}
+
+// === Phone player ===
+
+/// The offline player page and its vendored hls.js (1.5.17), baked into the
+/// binary so a phone on the cabin LAN needs no internet.
+async fn index_page() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/html; charset=utf-8")], include_str!("../../assets/index.html"))
+}
+
+async fn hls_js() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "application/javascript")], include_bytes!("../../assets/hls.min.js").as_slice())
 }
 
 /// Loopback peer, counting an IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`).
@@ -266,6 +280,11 @@ mod tests {
             .unwrap()
     }
 
+    async fn body_string(res: Response) -> String {
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
     fn from_ip(ip: [u8; 4]) -> MockConnectInfo<SocketAddr> {
         MockConnectInfo(SocketAddr::from((ip, 5000)))
     }
@@ -327,6 +346,24 @@ mod tests {
         let (state, _dir) = test_state();
         let res = router(state).oneshot(get("/health")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn index_page_has_a_player() {
+        let (state, _dir) = test_state();
+        let res = router(state).oneshot(get("/")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+        let body = body_string(res).await;
+        assert!(body.contains("<video") && body.contains("/hls.min.js") && !body.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn hls_js_is_embedded() {
+        let (state, _dir) = test_state();
+        let res = router(state).oneshot(get("/hls.min.js")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "application/javascript");
     }
 
     #[test]

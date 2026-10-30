@@ -1,7 +1,9 @@
 //! Peer manager — tracks known peers, drives the epidemic sync loop.
 //!
-//! Every 30 seconds, connects to each known peer and runs a sync session
-//! via the epidemic router. Failed connections are retried with backoff.
+//! Ticks every second and runs one sync session per due peer via the
+//! epidemic router. After a success a peer is next tried one sync interval
+//! later; after a failure it backs off 1 s, 2 s, 4 s, 8 s, capped at 15 s,
+//! so a link that drops is picked up again within seconds.
 //! Peers can be added via CLI flag (--peer) or the HTTP API at runtime.
 
 use std::collections::HashMap;
@@ -20,6 +22,16 @@ use crate::router::EpidemicRouter;
 
 // === Peer state ===
 
+/// Delay before the next attempt: the sync interval after a success, then a
+/// short capped backoff (1, 2, 4, 8, 15 s) while the peer keeps failing.
+pub fn retry_delay(failed_attempts: u32, sync_interval: Duration) -> Duration {
+    match failed_attempts {
+        0 => sync_interval,
+        1..=4 => Duration::from_secs(1 << (failed_attempts - 1)),
+        _ => Duration::from_secs(15),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PeerInfo {
     pub relay_addr: String,
@@ -27,6 +39,9 @@ pub struct PeerInfo {
     pub last_sync: Option<DateTime<Utc>>,
     pub bundles_received: usize,
     pub failed_attempts: u32,
+    /// A session with this peer is in flight.
+    pub syncing: bool,
+    pub next_attempt: DateTime<Utc>,
 }
 
 impl PeerInfo {
@@ -37,17 +52,14 @@ impl PeerInfo {
             last_sync: None,
             bundles_received: 0,
             failed_attempts: 0,
+            syncing: false,
+            next_attempt: Utc::now(),
         }
     }
 
-    /// Exponential backoff: skip this peer if it failed recently.
-    fn should_retry(&self) -> bool {
-        let Some(last_sync) = self.last_sync else {
-            return true; // never tried
-        };
-        let backoff_secs = (2u64).pow(self.failed_attempts.min(6)) * 30;
-        let elapsed = Utc::now().signed_duration_since(last_sync).num_seconds();
-        elapsed as u64 >= backoff_secs
+    /// Ready for a new session: none in flight and the backoff has elapsed.
+    fn due(&self, now: DateTime<Utc>) -> bool {
+        !self.syncing && now >= self.next_attempt
     }
 }
 
@@ -61,7 +73,12 @@ pub struct PeerManager {
 }
 
 impl PeerManager {
-    pub fn new(router: Arc<EpidemicRouter>, auth: Arc<RelayAuth>, initial_peers: Vec<String>) -> Self {
+    pub fn new(
+        router: Arc<EpidemicRouter>,
+        auth: Arc<RelayAuth>,
+        initial_peers: Vec<String>,
+        sync_interval: Duration,
+    ) -> Self {
         let mut map = HashMap::new();
         for addr in initial_peers {
             map.insert(addr.clone(), PeerInfo::new(addr));
@@ -70,7 +87,7 @@ impl PeerManager {
             peers: Arc::new(RwLock::new(map)),
             router,
             auth,
-            sync_interval: Duration::from_secs(30),
+            sync_interval,
         }
     }
 
@@ -88,46 +105,55 @@ impl PeerManager {
         self.peers.read().await.values().cloned().collect()
     }
 
-    /// Outgoing sync loop — runs forever, syncs all peers on interval.
+    /// Outgoing sync loop — runs forever, ticking once a second and starting
+    /// a session for every due peer (at most one in flight per peer).
     pub async fn run_sync_loop(&self) {
         info!("Peer sync loop started (interval: {}s)", self.sync_interval.as_secs());
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
-            tokio::time::sleep(self.sync_interval).await;
+            tick.tick().await;
 
-            let peer_addrs: Vec<String> = {
-                let peers = self.peers.read().await;
+            // Select and mark under one lock so two ticks never double-start a peer.
+            let due: Vec<String> = {
+                let now = Utc::now();
+                let mut peers = self.peers.write().await;
                 peers
-                    .values()
-                    .filter(|p| p.should_retry())
-                    .map(|p| p.relay_addr.clone())
+                    .values_mut()
+                    .filter(|p| p.due(now))
+                    .map(|p| {
+                        p.syncing = true;
+                        p.relay_addr.clone()
+                    })
                     .collect()
             };
 
-            for addr in peer_addrs {
+            for addr in due {
                 let router = self.router.clone();
                 let peers = self.peers.clone();
-                let addr_clone = addr.clone();
-
                 let auth = self.auth.clone();
+                let sync_interval = self.sync_interval;
+
                 tokio::spawn(async move {
-                    match router.sync_with_peer(&addr_clone, auth).await {
-                        Ok(stats) => {
-                            let mut map = peers.write().await;
-                            if let Some(peer) = map.get_mut(&addr_clone) {
-                                peer.last_seen = Some(Utc::now());
-                                peer.last_sync = Some(Utc::now());
+                    let result = router.sync_with_peer(&addr, auth).await;
+                    let now = Utc::now();
+                    let mut map = peers.write().await;
+                    if let Some(peer) = map.get_mut(&addr) {
+                        peer.last_sync = Some(now);
+                        match result {
+                            Ok(stats) => {
+                                peer.last_seen = Some(now);
                                 peer.bundles_received += stats.received;
                                 peer.failed_attempts = 0;
                             }
-                        }
-                        Err(e) => {
-                            debug!("Sync failed with {}: {}", addr_clone, e);
-                            let mut map = peers.write().await;
-                            if let Some(peer) = map.get_mut(&addr_clone) {
-                                peer.last_sync = Some(Utc::now());
+                            Err(e) => {
+                                debug!("Sync failed with {}: {}", addr, e);
                                 peer.failed_attempts += 1;
                             }
                         }
+                        peer.syncing = false;
+                        let delay = retry_delay(peer.failed_attempts, sync_interval);
+                        peer.next_attempt = now
+                            + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(15));
                     }
                 });
             }
@@ -154,8 +180,8 @@ impl PeerManager {
                 }
                 match router.handle_incoming(stream).await {
                     Ok(stats) => {
-                        // Register peer if not already known
-                        let relay_addr = format!("{}:{}", peer_addr.ip(), 7778);
+                        // Register peer if not already known, at the relay port it advertised
+                        let relay_addr = format!("{}:{}", peer_addr.ip(), stats.peer_relay_port);
                         let mut map = peers.write().await;
                         let peer = map
                             .entry(relay_addr.clone())
@@ -169,5 +195,35 @@ impl PeerManager {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_backs_off_to_fifteen_seconds() {
+        let i = Duration::from_secs(5);
+        let got: Vec<u64> = (0..7).map(|n| retry_delay(n, i).as_secs()).collect();
+        assert_eq!(got, vec![5, 1, 2, 4, 8, 15, 15]);
+    }
+
+    #[test]
+    fn peer_not_due_while_syncing() {
+        let mut p = PeerInfo::new("127.0.0.1:18778".into());
+        let now = Utc::now(); // after `new`, whose next_attempt is its creation time
+        assert!(p.due(now));
+        p.syncing = true;
+        assert!(!p.due(now + chrono::Duration::hours(1)));
+    }
+
+    #[test]
+    fn peer_due_after_next_attempt() {
+        let now = Utc::now();
+        let mut p = PeerInfo::new("x:1".into());
+        p.next_attempt = now + chrono::Duration::seconds(4);
+        assert!(!p.due(now));
+        assert!(p.due(now + chrono::Duration::seconds(4)));
     }
 }

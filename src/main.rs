@@ -83,6 +83,14 @@ enum Command {
         /// Use 0.0.0.0 to expose the API on all interfaces (e.g. for remote access).
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+
+        /// Seconds of delay the link tolerates before a bundle is considered late.
+        #[arg(long, default_value = "120")]
+        delay: u64,
+
+        /// Seconds between syncs with a healthy peer.
+        #[arg(long, default_value = "5")]
+        sync_interval: u64,
     },
 
     /// Ingest a local video file into the running cosmosd daemon.
@@ -116,8 +124,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, bind } => {
-            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, bind).await?;
+        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, bind, delay, sync_interval } => {
+            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, bind, delay, sync_interval).await?;
         }
         Command::Ingest { file, title, daemon, priority } => {
             ingest_file(file, title, daemon, priority).await?;
@@ -136,6 +144,8 @@ async fn serve(
     relay_token: Option<String>,
     no_discovery: bool,
     bind: String,
+    delay: u64,
+    sync_interval: u64,
 ) -> Result<()> {
     let node_id = node_id.unwrap_or_else(|| {
         hostname::get()
@@ -159,11 +169,16 @@ async fn serve(
         store.clone(),
         node_id.clone(),
         relay_port,
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(delay),
     ));
 
     // 3. Peer manager — outgoing sync + incoming relay
-    let peer_manager = Arc::new(PeerManager::new(epidemic_router, relay_auth, initial_peers));
+    let peer_manager = Arc::new(PeerManager::new(
+        epidemic_router,
+        relay_auth,
+        initial_peers,
+        std::time::Duration::from_secs(sync_interval),
+    ));
 
     // 4. Background: reap expired bundles every 5 minutes
     {

@@ -155,7 +155,12 @@ async fn serve(
     let relay_auth = Arc::new(RelayAuth::new(relay_token));
 
     // 2. Epidemic router — shared by peer manager
-    let epidemic_router = Arc::new(EpidemicRouter::new(store.clone(), node_id.clone()));
+    let epidemic_router = Arc::new(EpidemicRouter::new(
+        store.clone(),
+        node_id.clone(),
+        relay_port,
+        std::time::Duration::from_secs(120),
+    ));
 
     // 3. Peer manager — outgoing sync + incoming relay
     let peer_manager = Arc::new(PeerManager::new(epidemic_router, relay_auth, initial_peers));

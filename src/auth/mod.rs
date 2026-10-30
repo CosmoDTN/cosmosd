@@ -8,9 +8,11 @@
 //! Proper peer authentication (e.g. node keypairs) is a future milestone.
 
 use anyhow::{bail, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 use tracing::warn;
+
+use crate::router::FRAME_TIMEOUT;
 
 pub struct RelayAuth {
     token: Option<String>,
@@ -29,7 +31,7 @@ impl RelayAuth {
 
     /// Called by the relay listener on each incoming connection.
     /// Reads the auth frame and validates the token.
-    pub async fn verify_incoming(&self, stream: &mut TcpStream) -> Result<()> {
+    pub async fn verify_incoming(&self, stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<()> {
         let Some(expected) = &self.token else {
             return Ok(()); // open relay
         };
@@ -45,7 +47,7 @@ impl RelayAuth {
 
     /// Called by the peer manager before sending our manifest.
     /// Sends our token and waits for acknowledgement.
-    pub async fn authenticate_outgoing(&self, stream: &mut TcpStream) -> Result<()> {
+    pub async fn authenticate_outgoing(&self, stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<()> {
         let Some(token) = &self.token else {
             return Ok(()); // open relay
         };
@@ -59,7 +61,7 @@ impl RelayAuth {
     }
 }
 
-async fn send_auth_frame(stream: &mut TcpStream, data: &str) -> Result<()> {
+async fn send_auth_frame<S: AsyncWrite + Unpin>(stream: &mut S, data: &str) -> Result<()> {
     let bytes = data.as_bytes();
     let len = bytes.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
@@ -67,15 +69,15 @@ async fn send_auth_frame(stream: &mut TcpStream, data: &str) -> Result<()> {
     Ok(())
 }
 
-async fn recv_auth_frame(stream: &mut TcpStream) -> Result<String> {
+async fn recv_auth_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<String> {
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
+    timeout(FRAME_TIMEOUT, stream.read_exact(&mut len_buf)).await??;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > 512 {
         bail!("Auth frame too large");
     }
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
+    timeout(FRAME_TIMEOUT, stream.read_exact(&mut buf)).await??;
     Ok(String::from_utf8(buf)?)
 }
 

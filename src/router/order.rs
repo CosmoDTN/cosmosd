@@ -10,8 +10,6 @@ use crate::bundle::Priority;
 // === Types ===
 
 /// One line of a peer's manifest: a bundle id and how urgently it is wanted.
-// Used by Task 4 sync protocol.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub id: String,
@@ -29,8 +27,6 @@ fn parse_id(id: &str) -> Option<(&str, u32)> {
 /// Order the bundles we lack so the ones a viewer needs soonest come first:
 /// the live window (newest segments, ascending), then live backfill (newest
 /// first), then VOD ascending. Unparsable ids go last.
-// Used by Task 4 sync protocol.
-#[allow(dead_code)]
 pub fn pull_order(their: &[ManifestEntry], ours: &HashSet<String>, delay: Duration) -> Vec<String> {
     // Newest seq per live/near-live content, over everything they have.
     let mut newest: HashMap<&str, u32> = HashMap::new();

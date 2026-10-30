@@ -4,7 +4,6 @@ use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Serialize};
 
 /// Peer protocol version carried in the handshake.
-#[allow(dead_code)] // used by the handshake from Task 4
 pub const PROTOCOL_VERSION: u16 = 2;
 
 // === Encode / decode ===

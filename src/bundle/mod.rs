@@ -135,7 +135,6 @@ impl Bundle {
     }
 
     /// Set the segment playback duration.
-    #[allow(dead_code)] // used by live ingest in a later task
     pub fn with_duration_ms(mut self, ms: u32) -> Self {
         self.duration_ms = ms;
         self

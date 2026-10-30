@@ -9,6 +9,7 @@
 //!   cosmosd serve --bind 0.0.0.0                     # Expose API on all interfaces
 //!   cosmosd ingest /path/to/movie.mkv                # Ingest a local file
 //!   cosmosd ingest /path/to/movie.mkv --title "Dune" # With custom title
+//!   cosmosd ingest --live udp://127.0.0.1:5000 --content-id demo  # Live stream
 
 mod api;
 mod auth;
@@ -16,6 +17,7 @@ mod bundle;
 // Used by the store, router and API from Tasks 2/4 onward.
 mod codec;
 mod discovery;
+mod ingest;
 mod peer;
 mod router;
 mod store;
@@ -24,8 +26,7 @@ mod transport;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use base64::Engine;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -93,11 +94,20 @@ enum Command {
         sync_interval: u64,
     },
 
-    /// Ingest a local video file into the running cosmosd daemon.
-    /// Requires ffmpeg to be installed. The daemon must be running.
+    /// Ingest a local video file, or a live stream (--live), into the running
+    /// cosmosd daemon. Requires ffmpeg to be installed. The daemon must be running.
     Ingest {
         /// Path to the video file (mkv, mp4, avi, etc.).
-        file: PathBuf,
+        #[arg(required_unless_present = "live", conflicts_with = "live")]
+        file: Option<PathBuf>,
+
+        /// Live input URL for ffmpeg (e.g. udp://127.0.0.1:5000). Needs --content-id.
+        #[arg(long, requires = "content_id")]
+        live: Option<String>,
+
+        /// Content ID for a live stream.
+        #[arg(long)]
+        content_id: Option<String>,
 
         /// Content title. Defaults to the filename stem.
         #[arg(long)]
@@ -110,6 +120,10 @@ enum Command {
         /// Bundle priority: vod, near_live, or live.
         #[arg(long, default_value = "vod")]
         priority: String,
+
+        /// Live only: total bitrate cap in kbps (video + 128 kbps audio).
+        #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u32).range(400..))]
+        max_bitrate: u32,
     },
 }
 
@@ -127,8 +141,16 @@ async fn main() -> Result<()> {
         Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, bind, delay, sync_interval } => {
             serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, bind, delay, sync_interval).await?;
         }
-        Command::Ingest { file, title, daemon, priority } => {
-            ingest_file(file, title, daemon, priority).await?;
+        Command::Ingest { file, live, content_id, title, daemon, priority, max_bitrate } => {
+            match (file, live) {
+                (_, Some(url)) => {
+                    let content_id = content_id.expect("clap enforces --content-id with --live");
+                    let title = title.unwrap_or_else(|| content_id.clone());
+                    ingest::ingest_live(url, content_id, title, daemon, max_bitrate).await?;
+                }
+                (Some(file), None) => ingest::ingest_file(file, title, daemon, priority).await?,
+                (None, None) => unreachable!("clap requires FILE or --live"),
+            }
         }
     }
 
@@ -237,116 +259,4 @@ async fn serve(
 
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-// === Ingest subcommand ===
-
-async fn ingest_file(
-    file: PathBuf,
-    title: Option<String>,
-    daemon: String,
-    priority: String,
-) -> Result<()> {
-    let file = file.canonicalize().context("File not found")?;
-    let title = title.unwrap_or_else(|| {
-        file.file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
-    let content_id = file
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase()
-        .replace(' ', "_")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .take(40)
-        .collect::<String>();
-
-    // 1. Check ffmpeg is available
-    which_ffmpeg().context("ffmpeg not found — install it: apt install ffmpeg / brew install ffmpeg")?;
-
-    // 2. Check daemon is reachable
-    let client = reqwest::Client::new();
-    client
-        .get(format!("{}/health", daemon))
-        .send()
-        .await
-        .context("Cannot reach cosmosd — is it running? cosmosd serve")?;
-
-    info!("Ingesting: {}", title);
-    info!("File:      {}", file.display());
-    info!("Content ID:{}", content_id);
-    info!("Daemon:    {}", daemon);
-
-    // 3. Chunk into HLS segments with ffmpeg
-    let tmp = tempfile::tempdir()?;
-    let hls_dir = tmp.path();
-
-    info!("Chunking with ffmpeg...");
-    let status = std::process::Command::new("ffmpeg")
-        .args([
-            "-y", "-i", file.to_str().unwrap(),
-            "-map", "0:v:0",   // first video stream only
-            "-map", "0:a:0",   // first audio stream only
-            "-codec", "copy",
-            "-hls_time", "10",
-            "-hls_list_size", "0",
-            "-hls_segment_filename", &format!("{}/seg%05d.ts", hls_dir.display()),
-            "-f", "hls",
-            &format!("{}/index.m3u8", hls_dir.display()),
-        ])
-        .status()
-        .context("ffmpeg failed to run")?;
-
-    anyhow::ensure!(status.success(), "ffmpeg exited with error");
-
-    // 4. Push each segment to cosmosd
-    let mut segments: Vec<_> = std::fs::read_dir(hls_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|x| x == "ts").unwrap_or(false))
-        .map(|e| e.path())
-        .collect();
-    segments.sort();
-
-    info!("Pushing {} segments to {}...", segments.len(), daemon);
-
-    for (i, seg_path) in segments.iter().enumerate() {
-        let payload = std::fs::read(seg_path)?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
-
-        let resp = client
-            .post(format!("{}/ingest", daemon))
-            .json(&serde_json::json!({
-                "content_id":    content_id,
-                "content_title": title,
-                "sequence":      i,
-                "mime_type":     "video/mp2t",
-                "priority":      priority,
-                "payload_b64":   b64,
-            }))
-            .send()
-            .await
-            .with_context(|| format!("Failed to push segment {}", i))?;
-
-        let data: serde_json::Value = resp.json().await?;
-        info!("  seg{:05} → {} (stored={})", i, data["bundle_id"], data["stored"]);
-    }
-
-    info!("Done: {} ({} segments)", title, segments.len());
-    info!("Play: ffplay {}/play/{}", daemon, content_id);
-    Ok(())
-}
-
-fn which_ffmpeg() -> Option<()> {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()
-        .filter(|s| s.success())
-        .map(|_| ())
 }

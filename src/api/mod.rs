@@ -166,8 +166,15 @@ struct IngestRequest {
     sequence: u32,
     mime_type: String,
     priority: Priority,
+    /// Segment duration in milliseconds.
+    #[serde(default = "default_duration_ms")]
+    duration_ms: u32,
     /// Base64-encoded segment payload.
     payload_b64: String,
+}
+
+fn default_duration_ms() -> u32 {
+    10_000
 }
 
 #[derive(Serialize)]
@@ -193,7 +200,8 @@ async fn ingest(
         req.priority,
         payload,
         &state.node_id,
-    );
+    )
+    .with_duration_ms(req.duration_ms);
     let bundle_id = bundle.id.to_string();
     let stored = state.store.insert(&bundle)?;
 

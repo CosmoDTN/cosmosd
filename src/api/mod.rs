@@ -1,14 +1,16 @@
 //! Local HTTP API — used by cosmoscast-sdk and cosmoscast-ingest.
 //!
-//! All endpoints bind to localhost only. No authentication needed
-//! since this is a local daemon API (not exposed to the network).
+//! Binds to localhost by default. With `--bind` on a LAN address the read
+//! routes are open to the network, but the write routes (`POST /ingest`,
+//! `POST /peers`) answer only to loopback peers.
 
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json,
@@ -64,15 +66,38 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 const INGEST_BODY_LIMIT: usize = 80 * 1024 * 1024;
 
 pub fn router(state: ApiState) -> Router {
+    let writes = Router::new()
+        .route("/ingest", post(ingest).layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT)))
+        .route("/peers", post(add_peer))
+        .route_layer(middleware::from_fn(localhost_only));
+
     Router::new()
         .route("/health", get(health))
         .route("/catalog", get(catalog))
         .route("/play/:content_id", get(hls_playlist_handler))
         .route("/segment/:content_id/:sequence", get(hls_segment_handler))
-        .route("/ingest", post(ingest).layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT)))
         .route("/peers", get(list_peers))
-        .route("/peers", post(add_peer))
+        .merge(writes)
         .with_state(state)
+}
+
+/// Loopback peer, counting an IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`).
+fn is_local(peer: SocketAddr) -> bool {
+    peer.ip().to_canonical().is_loopback()
+}
+
+/// Guard for the write routes: with the API bound to the LAN, only the
+/// machine itself may change state. Only these routes read `ConnectInfo`.
+async fn localhost_only(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if is_local(peer) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "write routes are localhost-only").into_response()
+    }
 }
 
 // === Handlers ===
@@ -217,19 +242,98 @@ async fn ingest(
 mod tests {
     use super::*;
     use crate::{auth::RelayAuth, router::EpidemicRouter};
+    use axum::{body::Body, extract::connect_info::MockConnectInfo, http::Request};
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
 
-    /// Serve the API on an ephemeral port; keeps the store's tempdir alive.
-    async fn serve() -> (String, tempfile::TempDir) {
+    fn test_state() -> (ApiState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(BundleStore::open(dir.path().to_str().unwrap()).unwrap());
         let delay = Duration::from_secs(120);
         let router = Arc::new(EpidemicRouter::new(store.clone(), "t".into(), 0, delay));
         let peers = Arc::new(PeerManager::new(router, Arc::new(RelayAuth::new(None)), vec![], delay));
-        let app = super::router(ApiState { store, node_id: "t".into(), peers, delay });
+        (ApiState { store, node_id: "t".into(), peers, delay }, dir)
+    }
+
+    fn get(path: &str) -> Request<Body> {
+        Request::get(path).body(Body::empty()).unwrap()
+    }
+
+    fn post_json(path: &str, json: &str) -> Request<Body> {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(json.to_owned()))
+            .unwrap()
+    }
+
+    fn from_ip(ip: [u8; 4]) -> MockConnectInfo<SocketAddr> {
+        MockConnectInfo(SocketAddr::from((ip, 5000)))
+    }
+
+    /// Serve the API on an ephemeral port; keeps the store's tempdir alive.
+    async fn serve() -> (String, tempfile::TempDir) {
+        let (state, dir) = test_state();
+        let app = super::router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap()
+        });
         (format!("http://{}", addr), dir)
+    }
+
+    const ADD_PEER: &str = r#"{"relay_addr":"1.2.3.4:7778"}"#;
+
+    #[tokio::test]
+    async fn post_peers_from_lan_is_forbidden() {
+        let (state, _dir) = test_state();
+        let app = router(state).layer(from_ip([192, 168, 1, 9]));
+        let res = app.oneshot(post_json("/peers", ADD_PEER)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"write routes are localhost-only");
+    }
+
+    #[tokio::test]
+    async fn post_ingest_from_lan_is_forbidden() {
+        let (state, _dir) = test_state();
+        let app = router(state).layer(from_ip([192, 168, 1, 9]));
+        let res = app.oneshot(post_json("/ingest", "{}")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_peers_from_localhost_is_allowed() {
+        let (state, _dir) = test_state();
+        let app = router(state).layer(from_ip([127, 0, 0, 1]));
+        let res = app.oneshot(post_json("/peers", ADD_PEER)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn read_routes_from_lan_are_allowed() {
+        for path in ["/catalog", "/peers"] {
+            let (state, _dir) = test_state();
+            let app = router(state).layer(from_ip([192, 168, 1, 9]));
+            let res = app.oneshot(get(path)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_routes_need_no_connect_info() {
+        let (state, _dir) = test_state();
+        let res = router(state).oneshot(get("/health")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn ipv6_and_mapped_loopback_count_as_local() {
+        assert!(is_local("[::1]:1".parse().unwrap()));
+        assert!(is_local("[::ffff:127.0.0.1]:1".parse().unwrap()));
+        assert!(!is_local("[::ffff:192.168.1.9]:1".parse().unwrap()));
     }
 
     /// A 10 s live segment at 1.2 Mbps is about 1.5 MB, 2 MB once base64'd:

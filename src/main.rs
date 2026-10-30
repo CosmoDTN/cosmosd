@@ -269,6 +269,6 @@ async fn serve(
     info!("  GET  http://{}/peers", addr);
     info!("  POST http://{}/ingest", addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
 }

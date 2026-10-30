@@ -32,7 +32,9 @@ sc() { awk -v s="$SCALE" -v x="$1" 'BEGIN { printf "%d", x * s + 0.5 }'; }
 DELAY=$(sc 120)
 CUT1=$(sc 240); RESTORE1=$(sc 270); CUT2=$(sc 420); RESTORE2=$(sc 720)
 DURATION=$(sc 960)
-QUIET_FROM=$(sc 240); QUIET_TO=$(sc 330)
+# The 30 s cut can only show once the 120 s buffer drains; the 5 min cut
+# stalls from about 540 s. So: no stall in [240, 530).
+QUIET_FROM=$(sc 240); QUIET_TO=$(sc 530)
 STALL_FROM=$(sc 420); STALL_TO=$(sc 780)
 LAG_MIN=$(sc 110); LAG_MAX=$(sc 180)
 
@@ -163,15 +165,17 @@ grep -q '^summary ' "$LOG" || fail "no summary line in play.log"
 grep -q ' start seq=' "$LOG" || fail "playback never started"
 
 # Event lines: t=<secs> <event...> seq=<n> lag=<secs>
+# Count stall starts with lo <= t <= hi, or lo <= t < hi when $3 is "open".
 stall_starts() {
-    awk -v lo="$1" -v hi="$2" '$2 == "stall" && $3 == "start" {
-        t = substr($1, 3) + 0; if (t >= lo && t <= hi) n++ } END { print n + 0 }' "$LOG"
+    awk -v lo="$1" -v hi="$2" -v open="${3:-}" '$2 == "stall" && $3 == "start" {
+        t = substr($1, 3) + 0
+        if (t >= lo && (open == "open" ? t < hi : t <= hi)) n++ } END { print n + 0 }' "$LOG"
 }
-QUIET=$(stall_starts "$QUIET_FROM" "$QUIET_TO")
+QUIET=$(stall_starts "$QUIET_FROM" "$QUIET_TO" open)
 STALLED=$(stall_starts "$STALL_FROM" "$STALL_TO")
 FINAL_LAG=$(awk '/^summary / { for (i = 2; i <= NF; i++) if ($i ~ /^final_lag=/) print substr($i, 11) }' "$LOG")
 
-[ "$QUIET" -eq 0 ] || fail "$QUIET stall(s) started between ${QUIET_FROM}s and ${QUIET_TO}s (the 30 s cut)"
+[ "$QUIET" -eq 0 ] || fail "$QUIET stall(s) started in [${QUIET_FROM}s, ${QUIET_TO}s) (the 30 s cut)"
 [ "$STALLED" -ge 1 ] || fail "no stall started between ${STALL_FROM}s and ${STALL_TO}s (the 5 min cut)"
 awk -v l="$FINAL_LAG" -v lo="$LAG_MIN" -v hi="$LAG_MAX" 'BEGIN { exit !(l >= lo && l <= hi) }' \
     || fail "final_lag=${FINAL_LAG}s, want ${LAG_MIN}..${LAG_MAX}s"

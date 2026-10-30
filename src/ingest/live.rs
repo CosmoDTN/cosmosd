@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
@@ -19,12 +19,15 @@ const AUDIO_KBPS: u32 = 128;
 // === ffmpeg ===
 
 /// ffmpeg arguments: 720p H.264 capped at `max_kbps` total, 10 s HLS segments.
-pub fn live_ffmpeg_args(input: &str, out_dir: &Path, max_kbps: u32) -> Vec<String> {
+/// `ts_offset` shifts output timestamps so a restarted run continues past the
+/// previous one instead of starting over near zero.
+pub fn live_ffmpeg_args(input: &str, out_dir: &Path, max_kbps: u32, ts_offset: Duration) -> Vec<String> {
     let v = max_kbps - AUDIO_KBPS;
     let out = out_dir.display();
     [
         "-hide_banner", "-loglevel", "warning",
         "-i", input,
+        "-output_ts_offset", &format!("{:.3}", ts_offset.as_secs_f64()),
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", "scale=-2:720",
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
@@ -81,7 +84,8 @@ pub async fn ingest_live(
     }
 }
 
-/// Run ffmpeg and forward its segments, restarting forever.
+/// Run ffmpeg and forward its segments, restarting forever. Each run's
+/// timestamps are offset by the time since the first run started.
 async fn run(
     input: &str,
     content_id: &str,
@@ -91,11 +95,12 @@ async fn run(
     client: &reqwest::Client,
     sequence: &mut u32,
 ) -> Result<()> {
+    let first_start = Instant::now();
     loop {
         let tmp = tempfile::tempdir()?;
         let dir = tmp.path();
         let mut child = Command::new("ffmpeg")
-            .args(live_ffmpeg_args(input, dir, max_kbps))
+            .args(live_ffmpeg_args(input, dir, max_kbps, first_start.elapsed()))
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .spawn()
@@ -164,11 +169,22 @@ mod tests {
 
     #[test]
     fn ffmpeg_args_cap_bitrate_and_cut_ten_seconds() {
-        let a = live_ffmpeg_args("udp://127.0.0.1:5000", Path::new("/t"), 1200);
+        let a = live_ffmpeg_args("udp://127.0.0.1:5000", Path::new("/t"), 1200, Duration::ZERO);
         let has = |k: &str, v: &str| a.windows(2).any(|w| w[0] == k && w[1] == v);
         assert!(has("-b:v", "1072k") && has("-maxrate", "1072k") && has("-bufsize", "2144k"));
         assert!(has("-c:v", "libx264") && has("-hls_time", "10") && has("-b:a", "128k"));
         assert!(has("-i", "udp://127.0.0.1:5000"));
+        assert!(has("-output_ts_offset", "0.000"));
         assert_eq!(a.last().unwrap(), "/t/index.m3u8");
+    }
+
+    #[test]
+    fn ffmpeg_args_offset_timestamps_after_a_restart() {
+        let a = live_ffmpeg_args("udp://127.0.0.1:5000", Path::new("/t"), 1200, Duration::from_millis(12_500));
+        let at = a.iter().position(|s| s == "-output_ts_offset").expect("offset flag");
+        assert_eq!(a[at + 1], "12.500");
+        // An output option: after the input, before the output path.
+        assert!(at > a.iter().position(|s| s == "-i").unwrap());
+        assert!(at < a.len() - 1);
     }
 }

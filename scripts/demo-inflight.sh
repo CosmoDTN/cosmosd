@@ -32,9 +32,9 @@ sc() { awk -v s="$SCALE" -v x="$1" 'BEGIN { printf "%d", x * s + 0.5 }'; }
 DELAY=$(sc 120)
 CUT1=$(sc 240); RESTORE1=$(sc 270); CUT2=$(sc 420); RESTORE2=$(sc 720)
 DURATION=$(sc 960)
-# The 30 s cut can only show once the 120 s buffer drains; the 5 min cut
-# stalls from about 540 s. So: no stall in [240, 530).
-QUIET_FROM=$(sc 240); QUIET_TO=$(sc 530)
+# The 30 s cut can only show once the 120 s buffer drains (by about 400 s);
+# the 5 min cut stalls from about 530 s. So: no stall in [240, 500).
+QUIET_FROM=$(sc 240); QUIET_TO=$(sc 500)
 STALL_FROM=$(sc 420); STALL_TO=$(sc 780)
 LAG_MIN=$(sc 110); LAG_MAX=$(sc 180)
 

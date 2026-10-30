@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use sled::Transactional;
 use chrono::Utc;
 use tracing::{debug, info};
 
@@ -32,14 +33,26 @@ impl BundleStore {
     /// Insert a bundle. Returns false if already present (dedup by BundleId).
     pub fn insert(&self, bundle: &Bundle) -> Result<bool> {
         let key = bundle.id.as_str().as_bytes();
-        if self.db.contains_key(key)? {
+        let value = encode(bundle)?;
+        let meta_value = encode(&bundle.meta())?;
+        // Both trees in one transaction, with the dedup check inside it, so a
+        // crash can't leave a payload without its meta entry.
+        let inserted = (&*self.db, &self.meta)
+            .transaction(|(db, meta)| -> sled::transaction::ConflictableTransactionResult<bool, ()> {
+                if db.get(key)?.is_some() {
+                    return Ok(false);
+                }
+                db.insert(key, value.as_slice())?;
+                meta.insert(key, meta_value.as_slice())?;
+                Ok(true)
+            })
+            .map_err(|e| anyhow::anyhow!("bundle insert transaction: {e:?}"))?;
+        if inserted {
+            debug!("Stored bundle: {}", bundle.id);
+        } else {
             debug!("Duplicate bundle ignored: {}", bundle.id);
-            return Ok(false);
         }
-        self.db.insert(key, encode(bundle)?)?;
-        self.meta.insert(key, encode(&bundle.meta())?)?;
-        debug!("Stored bundle: {}", bundle.id);
-        Ok(true)
+        Ok(inserted)
     }
 
     /// Retrieve a bundle by ID. Returns None if missing or expired.
@@ -162,6 +175,19 @@ mod tests {
     }
 
     #[test]
+    fn insert_writes_both_trees_and_dedups() {
+        let store = temp_store();
+        let b = make_bundle("show_a", 0);
+        assert!(store.insert(&b).unwrap());
+        let id = b.id.as_str();
+        let (db_raw, meta_raw) = (store.db.get(id).unwrap().unwrap(), store.meta.get(id).unwrap().unwrap());
+        assert!(!store.insert(&b).unwrap());
+        assert_eq!(store.db.get(id).unwrap().unwrap(), db_raw);
+        assert_eq!(store.meta.get(id).unwrap().unwrap(), meta_raw);
+        assert_eq!(store.meta.len(), 1);
+    }
+
+    #[test]
     fn insert_is_idempotent() {
         let store = temp_store();
         let b = make_bundle("show_a", 0);
@@ -233,7 +259,7 @@ mod tests {
     #[test]
     fn catalog_reports_last_sequence() {
         let store = temp_store();
-        for s in [0, 1, 7] { store.insert(&make_bundle("show_a", s)).unwrap(); }
+        for s in [7, 0, 1] { store.insert(&make_bundle("show_a", s)).unwrap(); }
         let a = store.catalog().unwrap().into_iter().find(|c| c.content_id == "show_a").unwrap();
         assert_eq!(a.last_sequence, 7);
         assert_eq!(a.segment_count, 3);

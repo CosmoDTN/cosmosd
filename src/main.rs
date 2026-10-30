@@ -75,7 +75,7 @@ enum Command {
 
         /// Optional shared secret guarding our relay port: peers that dial us
         /// must present it. Tokens for peers we dial go in `--peer host:port@token`.
-        #[arg(long)]
+        #[arg(long, value_parser = auth::non_blank_token)]
         relay_token: Option<String>,
 
         /// Disable peer discovery: no mDNS, and peers that connect to us are not
@@ -192,6 +192,7 @@ async fn serve(
     info!("HTTP API:      http://{}:{}", bind, port);
     info!("Relay port:    {}", relay_port);
 
+    let peers = initial_peers.iter().map(|a| auth::parse_peer(a)).collect::<Result<Vec<_>>>()?;
     let store = Arc::new(BundleStore::open(&store_path)?);
 
     // 1. Relay auth
@@ -209,7 +210,7 @@ async fn serve(
     let peer_manager = Arc::new(PeerManager::new(
         epidemic_router,
         relay_auth,
-        initial_peers.iter().map(|a| auth::parse_peer(a)).collect(),
+        peers,
         std::time::Duration::from_secs(sync_interval),
     )
     .with_incoming_registration(!no_discovery));
@@ -271,4 +272,17 @@ async fn serve(
 
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_token_must_not_be_blank() {
+        for token in ["", "   "] {
+            assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", token]).is_err(), "{token:?}");
+        }
+        assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", "s3cret"]).is_ok());
+    }
 }

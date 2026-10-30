@@ -76,12 +76,26 @@ where
 // === Peer arguments ===
 
 /// Split a `--peer` argument `host:port@token` at the first `@`. Addresses
-/// never contain `@`; tokens may.
-pub fn parse_peer(arg: &str) -> (String, Option<String>) {
+/// never contain `@`; tokens may. A blank token (`host@`) is an error.
+pub fn parse_peer(arg: &str) -> Result<(String, Option<String>)> {
     match arg.split_once('@') {
-        Some((addr, token)) => (addr.to_string(), Some(token.to_string())),
-        None => (arg.to_string(), None),
+        Some((addr, token)) => {
+            if token.trim().is_empty() {
+                bail!("--peer {arg}: empty token after '@' (drop the '@' for a peer without one)");
+            }
+            Ok((addr.to_string(), Some(token.to_string())))
+        }
+        None => Ok((arg.to_string(), None)),
     }
+}
+
+/// clap value parser for `--relay-token`: rejects empty or whitespace-only
+/// tokens, which would guard the relay with a secret anyone can guess.
+pub fn non_blank_token(s: &str) -> std::result::Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("the token must not be empty or whitespace".into());
+    }
+    Ok(s.to_string())
 }
 
 // === Open-relay guard ===
@@ -149,8 +163,23 @@ mod tests {
 
     #[test]
     fn parse_peer_splits_token() {
-        assert_eq!(parse_peer("1.2.3.4:443@s3cr@t"), ("1.2.3.4:443".into(), Some("s3cr@t".into())));
-        assert_eq!(parse_peer("10.0.0.2:7778"), ("10.0.0.2:7778".into(), None));
+        assert_eq!(parse_peer("1.2.3.4:443@s3cr@t").unwrap(), ("1.2.3.4:443".into(), Some("s3cr@t".into())));
+        assert_eq!(parse_peer("10.0.0.2:7778").unwrap(), ("10.0.0.2:7778".into(), None));
+    }
+
+    #[test]
+    fn parse_peer_rejects_empty_token() {
+        for arg in ["1.2.3.4:443@", "1.2.3.4:443@   "] {
+            let err = parse_peer(arg).expect_err(arg);
+            assert!(err.to_string().contains("empty token"), "{arg}: {err}");
+        }
+    }
+
+    #[test]
+    fn non_blank_token_rejects_empty_and_whitespace() {
+        assert_eq!(non_blank_token("s3cret").unwrap(), "s3cret");
+        assert!(non_blank_token("").is_err());
+        assert!(non_blank_token(" \t ").is_err());
     }
 
     #[test]

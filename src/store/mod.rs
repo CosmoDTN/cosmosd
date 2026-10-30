@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use sled::Transactional;
 use chrono::Utc;
 use tracing::{debug, info};
@@ -26,20 +26,32 @@ impl BundleStore {
     pub fn open(path: &str) -> Result<Self> {
         let db = sled::open(path).context("Failed to open bundle store")?;
         let meta = db.open_tree("meta").context("Failed to open bundle meta tree")?;
+        // Pre-protocol-2 stores hold JSON bundles in the default tree and no
+        // meta tree. `insert` writes both trees atomically, so this layout
+        // never arises otherwise. No migration: the content is short-lived.
+        if !db.is_empty() && meta.is_empty() {
+            bail!("store at {path} is from an older cosmosd (before sync protocol 2): delete it to start fresh");
+        }
         info!("Bundle store opened at {}", path);
         Ok(BundleStore { db, meta })
     }
 
-    /// Insert a bundle. Returns false if already present (dedup by BundleId).
+    /// Insert a bundle. Returns false if a valid copy is already present
+    /// (dedup by BundleId); an expired copy is overwritten.
     pub fn insert(&self, bundle: &Bundle) -> Result<bool> {
         let key = bundle.id.as_str().as_bytes();
         let value = encode(bundle)?;
         let meta_value = encode(&bundle.meta())?;
         // Both trees in one transaction, with the dedup check inside it, so a
-        // crash can't leave a payload without its meta entry.
+        // crash can't leave a payload without its meta entry. An expired (or
+        // unreadable) entry counts as absent, so re-ingest replaces it.
         let inserted = (&*self.db, &self.meta)
             .transaction(|(db, meta)| -> sled::transaction::ConflictableTransactionResult<bool, ()> {
-                if db.get(key)?.is_some() {
+                let live = match meta.get(key)? {
+                    Some(raw) => decode::<BundleMeta>(&raw).is_ok_and(|m| m.is_valid()),
+                    None => false,
+                };
+                if live && db.get(key)?.is_some() {
                     return Ok(false);
                 }
                 db.insert(key, value.as_slice())?;
@@ -263,6 +275,36 @@ mod tests {
         let a = store.catalog().unwrap().into_iter().find(|c| c.content_id == "show_a").unwrap();
         assert_eq!(a.last_sequence, 7);
         assert_eq!(a.segment_count, 3);
+    }
+
+    #[test]
+    fn open_refuses_legacy_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        {
+            // Pre-protocol-2 layout: JSON bundles in the default tree, no meta.
+            let db = sled::open(path).unwrap();
+            db.insert(b"show_a/00000", br#"{"id":"show_a/00000"}"#.to_vec()).unwrap();
+            db.flush().unwrap();
+        }
+        let err = BundleStore::open(path).err().expect("legacy store must not open");
+        assert_eq!(
+            err.to_string(),
+            format!("store at {path} is from an older cosmosd (before sync protocol 2): delete it to start fresh")
+        );
+    }
+
+    #[test]
+    fn insert_replaces_expired_entry() {
+        let store = temp_store();
+        let mut old = make_bundle("show_a", 0);
+        old.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        insert_raw(&store, &old);
+        let fresh = make_bundle("show_a", 0);
+        assert!(store.insert(&fresh).unwrap());
+        let got = store.get(fresh.id.as_str()).unwrap().expect("fresh bundle readable");
+        assert_eq!(got.expires_at, fresh.expires_at);
+        assert_eq!(store.list_meta("show_a").unwrap().len(), 1);
     }
 
     #[test]

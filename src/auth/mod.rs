@@ -9,7 +9,7 @@
 //! This is intentionally simple — a pre-shared token, not a PKI system.
 //! Proper peer authentication (e.g. node keypairs) is a future milestone.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{bail, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -107,20 +107,42 @@ pub fn is_public_v4(ip: Ipv4Addr) -> bool {
     !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || cgnat)
 }
 
-/// Refuse to run an open relay on a public address. With a token or
-/// `--open-relay` this passes; if interfaces can't be listed it only warns.
-pub fn check_open_relay(has_token: bool, open_relay: bool) -> Result<()> {
+/// Whether any of `ips` is a public IPv4 address.
+pub fn any_public_v4(ips: &[IpAddr]) -> bool {
+    ips.iter().any(|ip| matches!(ip, IpAddr::V4(v4) if is_public_v4(*v4)))
+}
+
+/// Why `serve` must refuse to start, if it must. A token or `--open-relay`
+/// always passes. Otherwise a `--no-discovery` node (the ground role, which
+/// strangers dial) is refused outright, since NAT and containers can hide
+/// that it is exposed; any other node is refused only on a public address.
+pub fn open_relay_refusal(has_token: bool, open_relay: bool, no_discovery: bool, public: bool) -> Option<&'static str> {
+    if has_token || open_relay {
+        None
+    } else if no_discovery {
+        Some("refusing an open relay with --no-discovery (ground role): set --relay-token or pass --open-relay")
+    } else if public {
+        Some("refusing an open relay on a public address: set --relay-token or pass --open-relay")
+    } else {
+        None
+    }
+}
+
+/// Apply `open_relay_refusal` to this machine's interfaces. If they can't be
+/// listed, the public-address check only warns.
+pub fn check_open_relay(has_token: bool, open_relay: bool, no_discovery: bool) -> Result<()> {
     if has_token || open_relay {
         return Ok(());
     }
-    match if_addrs::get_if_addrs() {
-        Ok(ifaces) => {
-            let public = ifaces.iter().any(|i| matches!(i.ip(), std::net::IpAddr::V4(v4) if is_public_v4(v4)));
-            if public {
-                bail!("refusing an open relay on a public address: set --relay-token or pass --open-relay");
-            }
+    let public = match if_addrs::get_if_addrs() {
+        Ok(ifaces) => any_public_v4(&ifaces.iter().map(|i| i.ip()).collect::<Vec<_>>()),
+        Err(e) => {
+            warn!("could not list network interfaces, skipping the public-address check: {}", e);
+            false
         }
-        Err(e) => warn!("could not list network interfaces, skipping the open-relay check: {}", e),
+    };
+    if let Some(msg) = open_relay_refusal(has_token, open_relay, no_discovery, public) {
+        bail!(msg);
     }
     Ok(())
 }
@@ -193,8 +215,37 @@ mod tests {
 
     #[test]
     fn open_relay_guard_passes_with_token_or_flag() {
-        assert!(check_open_relay(true, false).is_ok());
-        assert!(check_open_relay(false, true).is_ok());
+        assert!(check_open_relay(true, false, false).is_ok());
+        assert!(check_open_relay(false, true, false).is_ok());
+        assert!(check_open_relay(true, false, true).is_ok());
+        assert!(check_open_relay(false, true, true).is_ok());
+    }
+
+    #[test]
+    fn open_relay_refused_for_ground_role() {
+        // --no-discovery without a token is refused even with no public IP:
+        // NAT and containers hide public exposure.
+        let msg = open_relay_refusal(false, false, true, false).expect("refused");
+        assert!(msg.contains("--no-discovery") && msg.contains("--relay-token") && msg.contains("--open-relay"), "{msg}");
+        assert!(check_open_relay(false, false, true).is_err());
+    }
+
+    #[test]
+    fn open_relay_refused_on_public_address() {
+        let msg = open_relay_refusal(false, false, false, true).expect("refused");
+        assert!(msg.contains("public address"), "{msg}");
+        assert!(open_relay_refusal(false, false, false, false).is_none());
+        for (token, open) in [(true, false), (false, true)] {
+            assert!(open_relay_refusal(token, open, true, true).is_none());
+        }
+    }
+
+    #[test]
+    fn any_public_v4_ignores_private_and_v6() {
+        let ips = |list: &[&str]| list.iter().map(|s| s.parse().unwrap()).collect::<Vec<std::net::IpAddr>>();
+        assert!(!any_public_v4(&ips(&["127.0.0.1", "192.168.1.5", "10.0.0.1", "2001:4860:4860::8888"])));
+        assert!(any_public_v4(&ips(&["127.0.0.1", "8.8.8.8"])));
+        assert!(!any_public_v4(&[]));
     }
 
     #[tokio::test]

@@ -134,8 +134,8 @@ cosmosd serve --relay-token my-secret
 # Present a peer's token when dialing it (token follows the first @)
 cosmosd serve --peer ground.example.com:443@their-secret
 
-# Disable mDNS auto-discovery (for controlled environments)
-cosmosd serve --no-discovery
+# Disable mDNS auto-discovery (for controlled environments; needs a token)
+cosmosd serve --no-discovery --relay-token my-secret
 ```
 
 All options:
@@ -148,8 +148,8 @@ All options:
 | `--store` | `.cosmosd/store` | Bundle store directory |
 | `--node-id` | hostname | Human-readable node identifier |
 | `--relay-token` | — | Shared secret guarding our relay port; peers that dial us must present it. It is not sent to peers we dial |
-| `--open-relay` | false | Allow a relay with no `--relay-token` on a machine that has a public IPv4 address (otherwise `serve` refuses to start) |
-| `--no-discovery` | false | Disable discovery: no mDNS, and peers that connect in are not dialed back |
+| `--open-relay` | false | Allow a relay with no `--relay-token` with `--no-discovery` or on a machine that has a public IPv4 address (otherwise `serve` refuses to start) |
+| `--no-discovery` | false | Disable discovery: no mDNS, and peers that connect in are not dialed back. This is the ground role, so it needs `--relay-token` (or `--open-relay`) |
 | `--bind` | `127.0.0.1` | HTTP API bind address (`0.0.0.0` to expose on all interfaces) |
 | `--delay` | `120` | Seconds live playlists sit behind the newest segment |
 | `--sync-interval` | `5` | Seconds between syncs with a healthy peer |

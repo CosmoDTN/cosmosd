@@ -83,8 +83,8 @@ enum Command {
         #[arg(long, default_value = "false")]
         no_discovery: bool,
 
-        /// Run the relay without a --relay-token even if this machine has a
-        /// public IPv4 address.
+        /// Run the relay without a --relay-token even with --no-discovery (the
+        /// ground role) or on a machine that has a public IPv4 address.
         #[arg(long, default_value = "false")]
         open_relay: bool,
 
@@ -185,7 +185,7 @@ async fn serve(
             .unwrap_or_else(|| "cosmosd-node".to_string())
     });
 
-    auth::check_open_relay(relay_token.is_some(), open_relay)?;
+    auth::check_open_relay(relay_token.is_some(), open_relay, no_discovery)?;
 
     info!("CosmosD node:  {}", node_id);
     info!("Bundle store:  {}", store_path);

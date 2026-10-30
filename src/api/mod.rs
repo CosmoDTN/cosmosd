@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -59,13 +59,17 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 
 // === Routes ===
 
+/// Largest `POST /ingest` body. axum's 2 MB default turns away a single 10 s
+/// live segment once base64'd; this fits a 60 MB relay frame plus base64.
+const INGEST_BODY_LIMIT: usize = 80 * 1024 * 1024;
+
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/catalog", get(catalog))
         .route("/play/:content_id", get(hls_playlist_handler))
         .route("/segment/:content_id/:sequence", get(hls_segment_handler))
-        .route("/ingest", post(ingest))
+        .route("/ingest", post(ingest).layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT)))
         .route("/peers", get(list_peers))
         .route("/peers", post(add_peer))
         .with_state(state)
@@ -207,4 +211,45 @@ async fn ingest(
 
     info!("Ingest: {} (stored={})", bundle_id, stored);
     Ok(Json(IngestResponse { bundle_id, stored }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{auth::RelayAuth, router::EpidemicRouter};
+
+    /// Serve the API on an ephemeral port; keeps the store's tempdir alive.
+    async fn serve() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BundleStore::open(dir.path().to_str().unwrap()).unwrap());
+        let delay = Duration::from_secs(120);
+        let router = Arc::new(EpidemicRouter::new(store.clone(), "t".into(), 0, delay));
+        let peers = Arc::new(PeerManager::new(router, Arc::new(RelayAuth::new(None)), vec![], delay));
+        let app = super::router(ApiState { store, node_id: "t".into(), peers, delay });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}", addr), dir)
+    }
+
+    /// A 10 s live segment at 1.2 Mbps is about 1.5 MB, 2 MB once base64'd:
+    /// over axum's default body limit.
+    #[tokio::test]
+    async fn ingest_accepts_a_full_size_live_segment() {
+        use base64::Engine;
+        let (base, _dir) = serve().await;
+        let payload = vec![0x47u8; 3 * 1024 * 1024];
+        let body = serde_json::json!({
+            "content_id": "demo", "content_title": "demo", "sequence": 0,
+            "mime_type": "video/mp2t", "priority": "live",
+            "payload_b64": base64::engine::general_purpose::STANDARD.encode(&payload),
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("{}/ingest", base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
 }

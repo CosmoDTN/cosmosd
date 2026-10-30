@@ -23,6 +23,11 @@ use crate::auth::RelayAuth;
 use crate::bundle::Bundle;
 use crate::store::BundleStore;
 
+mod order;
+// Used by Task 4 sync protocol.
+#[allow(unused_imports)]
+pub use order::*;
+
 // === Wire types ===
 
 #[derive(Serialize, Deserialize)]

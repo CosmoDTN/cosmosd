@@ -354,6 +354,14 @@ Point any HLS player at:
 http://localhost:7777/play/my_show_ep1
 ```
 
+The short URL is a convenience. It answers 300 if two publishers share the
+content ID. For a live stream, or any player that stays open, use the
+publisher-qualified URL instead. `/catalog` and `cosmosd ingest` show the
+publisher ID.
+```
+http://localhost:7777/play/<publisher>/my_show_ep1
+```
+
 Or with `ffplay`:
 ```bash
 ffplay http://localhost:7777/play/my_show_ep1

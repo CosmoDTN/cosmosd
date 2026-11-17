@@ -567,6 +567,43 @@ mod tests {
         assert!(body.contains("++gen"), "play() needs a generation guard against stale responses");
     }
 
+    /// The player must never use the short `/play/<content_id>` form: it
+    /// answers 300 once a second publisher shares the content ID, which
+    /// would break a button or a live reload mid-playback.
+    #[test]
+    fn index_page_plays_publisher_qualified_urls() {
+        let page = include_str!("../../assets/index.html");
+        let builds: Vec<&str> = page.match_indices("'/play/' +").map(|(i, _)| &page[i..]).collect();
+        assert!(!builds.is_empty(), "the page builds a play URL");
+        for b in builds {
+            assert!(
+                b.starts_with("'/play/' + encodeURIComponent(c.publisher) + '/' + encodeURIComponent(c.content_id)"),
+                "play URL not publisher-qualified: {}",
+                &b[..b.len().min(80)]
+            );
+        }
+        assert!(!page.contains("'/segment/'"), "the page must leave segment URLs to the playlist");
+    }
+
+    #[tokio::test]
+    async fn catalog_entries_all_carry_publisher() {
+        let key = PublisherKey::generate();
+        let (state, _dir) = test_state_with_key(Some(key.clone()));
+        insert_segment(&state.store, P1, "other", 0);
+        let app = local_app(state);
+        let res = send(&app, post_json("/ingest", &ingest_body("show", 0, "vod", &seg_payload(0)))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let items: serde_json::Value =
+            serde_json::from_str(&body_string(send(&app, get("/catalog")).await).await).unwrap();
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        for c in items {
+            let publisher = c["publisher"].as_str().unwrap_or_else(|| panic!("no publisher in {c}"));
+            assert_eq!(publisher.len(), 16, "{c}");
+        }
+        assert!(items.iter().any(|c| c["publisher"] == key.key_id().0.as_str()));
+    }
+
     #[tokio::test]
     async fn hls_js_is_embedded() {
         let (state, _dir) = test_state();

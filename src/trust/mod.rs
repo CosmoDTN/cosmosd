@@ -62,6 +62,14 @@ impl PublisherKey {
         Ok(PublisherKey { signing: SigningKey::from_bytes(&seed) })
     }
 
+    /// Like `load`, but None when the dir holds no key file.
+    pub fn load_if_present(dir: &Path) -> Result<Option<Self>> {
+        if !dir.join(KEY_FILE).exists() {
+            return Ok(None);
+        }
+        Self::load(dir).map(Some)
+    }
+
     pub fn save(&self, dir: &Path) -> Result<()> {
         fs::create_dir_all(dir)?;
         let path = dir.join(KEY_FILE);
@@ -280,6 +288,15 @@ mod tests {
         let k = PublisherKey::generate();
         k.save(dir.path()).unwrap();
         assert_eq!(PublisherKey::load(dir.path()).unwrap().public(), k.public());
+    }
+
+    #[test]
+    fn load_if_present_is_none_without_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(PublisherKey::load_if_present(&dir.path().join("missing")).unwrap().is_none());
+        let k = PublisherKey::generate();
+        k.save(dir.path()).unwrap();
+        assert_eq!(PublisherKey::load_if_present(dir.path()).unwrap().unwrap().public(), k.public());
     }
 
     #[test]

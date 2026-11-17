@@ -259,6 +259,7 @@ async fn ingest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trust::{PairedKeys, Trust};
     use crate::{auth::RelayAuth, router::EpidemicRouter};
     use axum::{body::Body, extract::connect_info::MockConnectInfo, http::Request};
     use std::net::SocketAddr;
@@ -268,7 +269,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(BundleStore::open(dir.path().to_str().unwrap()).unwrap());
         let delay = Duration::from_secs(120);
-        let router = Arc::new(EpidemicRouter::new(store.clone(), "t".into(), 0, delay));
+        let trust = Arc::new(Trust::new(None, PairedKeys::open(dir.path()).unwrap()));
+        let router = Arc::new(EpidemicRouter::new(store.clone(), "t".into(), 0, delay, trust));
         let peers = Arc::new(PeerManager::new(router, Arc::new(RelayAuth::new(None)), vec![], delay));
         (ApiState { store, node_id: "t".into(), peers, delay }, dir)
     }

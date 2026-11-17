@@ -4,16 +4,24 @@
 //! A second tree, `meta`, holds each bundle's payload-free metadata so
 //! listing, the catalog and manifests never decode a payload. Expired bundles
 //! are purged lazily on read and periodically by the background reaper task.
+//!
+//! Bundles from peers enter through [`BundleStore::admit`]. A segment is
+//! stored only when a signed manifest from a trusted publisher lists its
+//! BLAKE3 hash. A segment that arrives before its manifest waits in the
+//! `pending` tree for [`HOLD_SECS`] and is never listed or offered to peers.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use sled::Transactional;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::bundle::{Bundle, BundleKind, BundleMeta};
+use crate::bundle::{check_content_id, Bundle, BundleId, BundleKind, BundleMeta};
 use crate::codec::{decode, encode};
+use crate::trust::manifest::{Manifest, SignedManifest};
+use crate::trust::{KeyId, KeyLookup};
 use crate::wire::{decode_bundle, encode_bundle};
 
 mod age;
@@ -21,11 +29,16 @@ pub use age::{MonoClock, SystemMono};
 #[cfg(test)]
 pub use age::FakeMono;
 
+/// Seconds of store clock time a segment waits for its manifest.
+pub const HOLD_SECS: u64 = 600;
+
 pub struct BundleStore {
     /// id -> RFC 9171 bundle bytes (payload included).
     db: sled::Db,
     /// id -> CBOR `BundleMeta`.
     meta: sled::Tree,
+    /// Segment id -> CBOR `HeldSegment`, for segments awaiting a manifest.
+    pending: sled::Tree,
     /// Decides expiry together with each bundle's age.
     clock: Arc<dyn MonoClock>,
 }
@@ -49,6 +62,7 @@ impl BundleStore {
         let db = sled::open(path).context("Failed to open bundle store")?;
         let meta = db.open_tree("meta").context("Failed to open bundle meta tree")?;
         let sys = db.open_tree("sys").context("Failed to open bundle sys tree")?;
+        let pending = db.open_tree("pending").context("Failed to open bundle pending tree")?;
         // Pre-protocol-2 stores hold JSON bundles in the default tree and no
         // meta tree. `insert` writes both trees atomically, so this layout
         // never arises otherwise. No migration: the content is short-lived.
@@ -65,7 +79,7 @@ impl BundleStore {
         }
         let clock = make_clock(sys)?;
         info!("Bundle store opened at {}", path);
-        Ok(BundleStore { db, meta, clock })
+        Ok(BundleStore { db, meta, pending, clock })
     }
 
     /// Persist the expiry clock. Call on a schedule and at shutdown.
@@ -197,7 +211,256 @@ impl BundleStore {
         if removed > 0 {
             info!("Reaped {} expired bundles", removed);
         }
-        Ok(removed)
+
+        let mut dropped = 0usize;
+        for item in self.pending.iter() {
+            let (key, value) = item?;
+            if decode::<HeldSegment>(&value).map_or(true, |h| h.hold_expired(now)) {
+                self.pending.remove(&key)?;
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            info!("Dropped {} held segments whose manifest never came", dropped);
+        }
+        Ok(removed + dropped)
+    }
+}
+
+// === Admission ===
+
+/// What [`BundleStore::admit`] did with a bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Verified and stored.
+    Stored,
+    /// A valid copy is already stored. For a manifest, the stored version is
+    /// the same or newer.
+    Duplicate,
+    /// A segment from a trusted publisher, waiting in `pending` for its manifest.
+    Held,
+    /// Refused and not stored. The reason is for logs.
+    Rejected(String),
+}
+
+fn reject(reason: impl Into<String>) -> Admission {
+    Admission::Rejected(reason.into())
+}
+
+/// A segment waiting for its manifest, with the store clock reading when it
+/// was first held.
+#[derive(Serialize, Deserialize)]
+struct HeldSegment {
+    held_at_ms: u64,
+    /// RFC 9171 bundle bytes.
+    #[serde(with = "serde_bytes")]
+    bundle: Vec<u8>,
+}
+
+impl HeldSegment {
+    fn hold_expired(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.held_at_ms) >= HOLD_SECS * 1000
+    }
+}
+
+/// Verify a manifest bundle's signed payload and return the manifest. The
+/// manifest must name the bundle's own publisher and content ID.
+fn verify_manifest(b: &Bundle, trust: &dyn KeyLookup) -> Result<Manifest> {
+    let m = SignedManifest::from_bytes(&b.payload)?.verify(trust)?;
+    if m.publisher != b.publisher {
+        bail!("manifest names publisher {} but the bundle is from {}", m.publisher, b.publisher);
+    }
+    if m.content_id != b.info.content_id {
+        bail!("manifest is for {:?} but the bundle is for {:?}", m.content_id, b.info.content_id);
+    }
+    Ok(m)
+}
+
+/// The version of a manifest already in the store. Stored manifests were
+/// verified on the way in, so this only decodes. None when it is unreadable.
+fn stored_manifest_version(raw: &[u8]) -> Option<u64> {
+    let b = decode_bundle(raw).ok()?;
+    let signed = SignedManifest::from_bytes(&b.payload).ok()?;
+    decode::<Manifest>(&signed.manifest_cbor).ok().map(|m| m.version)
+}
+
+/// Check a segment against a verified manifest of the same publisher and content.
+fn check_segment(b: &Bundle, m: &Manifest) -> Result<(), String> {
+    if b.publisher != m.publisher || b.info.content_id != m.content_id {
+        return Err(format!("segment {} does not belong to this manifest", b.id()));
+    }
+    let Some(entry) = m.hash_for(b.info.sequence) else {
+        return Err(format!("sequence {} is not in manifest version {}", b.info.sequence, m.version));
+    };
+    if blake3::hash(&b.payload).as_bytes() != &entry.hash {
+        return Err(format!("payload of {} does not match the manifest hash", b.id()));
+    }
+    Ok(())
+}
+
+impl BundleStore {
+    /// The gate for bundles from peers.
+    ///
+    /// The publisher must be in `trust`. A manifest must carry a valid
+    /// signature and is stored only when it is newer than the stored one. A
+    /// segment is stored only when the stored manifest lists its sequence with
+    /// the BLAKE3 hash of its payload. A segment with no manifest yet is held.
+    /// Hostile input gives `Rejected`, and only storage failures are errors.
+    pub fn admit(&self, b: &Bundle, trust: &dyn KeyLookup) -> Result<Admission> {
+        if !b.valid_on_arrival() {
+            return Ok(reject(format!("{} expired before it arrived", b.id())));
+        }
+        // Held segments are found by a `<publisher>/<content_id>/` prefix.
+        if let Err(e) = check_content_id(&b.info.content_id) {
+            return Ok(reject(e.to_string()));
+        }
+        if trust.lookup(&b.publisher).is_none() {
+            return Ok(reject(format!("publisher {} is not paired", b.publisher)));
+        }
+        match b.info.kind {
+            BundleKind::Manifest => self.admit_manifest(b, trust),
+            BundleKind::Segment => self.admit_segment(b, trust),
+        }
+    }
+
+    fn admit_manifest(&self, b: &Bundle, trust: &dyn KeyLookup) -> Result<Admission> {
+        let m = match verify_manifest(b, trust) {
+            Ok(m) => m,
+            Err(e) => return Ok(reject(format!("manifest {}: {e}", b.id()))),
+        };
+        let id = b.id();
+        let key = id.as_str().as_bytes();
+        let value = encode_bundle(b)?;
+        let now = self.clock.now_ms();
+        let meta_value = encode(&b.meta(now))?;
+        // The version check sits inside the transaction, so two manifests
+        // arriving at once can never leave the older one stored.
+        let replaced = (&*self.db, &self.meta)
+            .transaction(|(db, meta)| -> sled::transaction::ConflictableTransactionResult<bool, ()> {
+                let live = match meta.get(key)? {
+                    Some(raw) => decode::<BundleMeta>(&raw).is_ok_and(|m| m.is_valid(now)),
+                    None => false,
+                };
+                if live {
+                    if let Some(raw) = db.get(key)? {
+                        if stored_manifest_version(&raw).is_some_and(|v| v >= m.version) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                db.insert(key, value.as_slice())?;
+                meta.insert(key, meta_value.as_slice())?;
+                Ok(true)
+            })
+            .map_err(|e| anyhow::anyhow!("manifest insert transaction: {e:?}"))?;
+        if !replaced {
+            debug!("Manifest {} version {} is not newer, ignored", id, m.version);
+            return Ok(Admission::Duplicate);
+        }
+        debug!("Stored manifest {} version {}", id, m.version);
+        self.promote_held(&m)?;
+        Ok(Admission::Stored)
+    }
+
+    fn admit_segment(&self, b: &Bundle, trust: &dyn KeyLookup) -> Result<Admission> {
+        let Some(m) = self.current_manifest(&b.publisher, &b.info.content_id, trust)? else {
+            return self.hold(b, trust);
+        };
+        if let Err(reason) = check_segment(b, &m) {
+            return Ok(reject(reason));
+        }
+        Ok(if self.insert(b)? { Admission::Stored } else { Admission::Duplicate })
+    }
+
+    /// The stored manifest for a publisher's content, verified again against
+    /// `trust`. None when absent, expired, or no longer valid.
+    fn current_manifest(&self, publisher: &KeyId, content_id: &str, trust: &dyn KeyLookup) -> Result<Option<Manifest>> {
+        let id = BundleId::manifest(publisher, content_id);
+        let Some(b) = self.get(id.as_str())? else {
+            return Ok(None);
+        };
+        match verify_manifest(&b, trust) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) => {
+                warn!("Stored manifest {} does not verify: {}", id, e);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Put a segment in `pending`. A copy already held keeps its first hold
+    /// time, so sending it again never extends the hold.
+    fn hold(&self, b: &Bundle, trust: &dyn KeyLookup) -> Result<Admission> {
+        let id = b.id();
+        let key = id.as_str().as_bytes();
+        let now = self.clock.now_ms();
+        let already = match self.pending.get(key)? {
+            Some(raw) => decode::<HeldSegment>(&raw).is_ok_and(|h| !h.hold_expired(now)),
+            None => false,
+        };
+        if !already {
+            let held = HeldSegment { held_at_ms: now, bundle: encode_bundle(b)? };
+            self.pending.insert(key, encode(&held)?)?;
+            debug!("Holding {} until its manifest arrives", id);
+        }
+        // The manifest may have been stored, and its held segments promoted,
+        // after the lookup in `admit_segment` but before the insert above.
+        if let Some(m) = self.current_manifest(&b.publisher, &b.info.content_id, trust)? {
+            if let Some(raw) = self.pending.remove(key)? {
+                return self.promote_entry(&raw, &m);
+            }
+        }
+        Ok(Admission::Held)
+    }
+
+    /// Re-check every held segment of a manifest's content: store those whose
+    /// hash matches and drop the rest.
+    fn promote_held(&self, m: &Manifest) -> Result<()> {
+        let prefix = format!("{}/{}/", m.publisher, m.content_id);
+        let (mut stored, mut dropped) = (0usize, 0usize);
+        for item in self.pending.scan_prefix(prefix.as_bytes()) {
+            let (key, _) = item?;
+            // Removing first claims the entry, so a racing promoter skips it.
+            let Some(raw) = self.pending.remove(&key)? else {
+                continue;
+            };
+            match self.promote_entry(&raw, m)? {
+                Admission::Stored => stored += 1,
+                Admission::Rejected(reason) => {
+                    warn!("Dropped held segment: {}", reason);
+                    dropped += 1;
+                }
+                Admission::Duplicate | Admission::Held => {}
+            }
+        }
+        if stored + dropped > 0 {
+            info!("Manifest {}/{}: promoted {} held segments, dropped {}", m.publisher, m.content_id, stored, dropped);
+        }
+        Ok(())
+    }
+
+    /// Check one held entry, already removed from `pending`, and store it if
+    /// it passes. The time it spent held is added to its age.
+    fn promote_entry(&self, raw: &[u8], m: &Manifest) -> Result<Admission> {
+        let now = self.clock.now_ms();
+        let Ok(held) = decode::<HeldSegment>(raw) else {
+            return Ok(reject("unreadable held entry"));
+        };
+        if held.hold_expired(now) {
+            return Ok(reject("hold time ran out before the manifest arrived"));
+        }
+        let mut b = match decode_bundle(&held.bundle) {
+            Ok(b) => b,
+            Err(e) => return Ok(reject(format!("unreadable held bundle: {e}"))),
+        };
+        b.age_ms = b.age_ms.saturating_add(now.saturating_sub(held.held_at_ms));
+        if !b.valid_on_arrival() {
+            return Ok(reject(format!("{} expired while held", b.id())));
+        }
+        if let Err(reason) = check_segment(&b, m) {
+            return Ok(reject(reason));
+        }
+        Ok(if self.insert(&b)? { Admission::Stored } else { Admission::Duplicate })
     }
 }
 
@@ -205,7 +468,6 @@ impl BundleStore {
 mod tests {
     use super::*;
     use crate::bundle::Priority;
-    use crate::trust::KeyId;
 
     fn publisher() -> KeyId {
         KeyId("0123456789abcdef".into())
@@ -507,6 +769,272 @@ mod tests {
         assert_eq!(store.reap_expired().unwrap(), 1);
         assert!(store.db.get(b.id().as_str()).unwrap().is_none());
         assert!(store.meta.get(b.id().as_str()).unwrap().is_none());
+    }
+
+    // === Admission ===
+
+    mod admit {
+        use super::*;
+        use crate::bundle::BundleId;
+        use crate::trust::manifest::{Manifest, SegmentEntry, SignedManifest};
+        use crate::trust::{KeyLookup, PublisherKey};
+
+        /// Trusts exactly the keys it holds.
+        struct Keys(Vec<PublisherKey>);
+
+        impl KeyLookup for Keys {
+            fn lookup(&self, id: &KeyId) -> Option<[u8; 32]> {
+                self.0.iter().find(|k| k.key_id() == *id).map(|k| k.public())
+            }
+        }
+
+        fn payload(seq: u32) -> Vec<u8> {
+            format!("segment {seq}").into_bytes()
+        }
+
+        fn segment(key: &PublisherKey, seq: u32, payload: Vec<u8>) -> Bundle {
+            Bundle::segment(&key.key_id(), "show", "Show", seq, "video/mp2t", Priority::Vod, payload, "node-a").unwrap()
+        }
+
+        fn manifest(key: &PublisherKey, version: u64, seqs: impl IntoIterator<Item = u32>) -> Manifest {
+            Manifest {
+                publisher: key.key_id(),
+                content_id: "show".into(),
+                title: "Show".into(),
+                version,
+                created_at_ms: 1_700_000_000_000,
+                live: false,
+                segments: seqs
+                    .into_iter()
+                    .map(|s| SegmentEntry { sequence: s, hash: *blake3::hash(&payload(s)).as_bytes(), duration_ms: 10_000 })
+                    .collect(),
+            }
+        }
+
+        fn manifest_bundle(key: &PublisherKey, m: &Manifest) -> Bundle {
+            let signed = SignedManifest::sign(m, key).unwrap().to_bytes().unwrap();
+            Bundle::manifest(&key.key_id(), m, signed, "node-a")
+        }
+
+        fn stored_version(store: &BundleStore, key: &PublisherKey) -> u64 {
+            let b = store.get(BundleId::manifest(&key.key_id(), "show").as_str()).unwrap().expect("manifest stored");
+            let m: Manifest = decode(&SignedManifest::from_bytes(&b.payload).unwrap().manifest_cbor).unwrap();
+            m.version
+        }
+
+        fn is_stored(store: &BundleStore, b: &Bundle) -> bool {
+            store.get(b.id().as_str()).unwrap().is_some()
+        }
+
+        #[test]
+        fn manifest_then_segment_is_stored() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let m = manifest_bundle(&key, &manifest(&key, 1, 0..3));
+            assert_eq!(store.admit(&m, &keys).unwrap(), Admission::Stored);
+            let s = segment(&key, 1, payload(1));
+            assert_eq!(store.admit(&s, &keys).unwrap(), Admission::Stored);
+            assert_eq!(store.get(s.id().as_str()).unwrap().unwrap().payload, payload(1));
+            assert_eq!(store.admit(&s, &keys).unwrap(), Admission::Duplicate);
+            assert!(store.all_ids().unwrap().contains(m.id().as_str()));
+        }
+
+        #[test]
+        fn segment_then_manifest_is_promoted() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let s = segment(&key, 2, payload(2));
+            assert_eq!(store.admit(&s, &keys).unwrap(), Admission::Held);
+            // Held segments are not offered to peers or listed anywhere.
+            assert!(!is_stored(&store, &s));
+            assert!(store.all_ids().unwrap().is_empty());
+            assert_eq!(store.pending.len(), 1);
+            store.clock.advance(5_000);
+            let m = manifest_bundle(&key, &manifest(&key, 1, 0..3));
+            assert_eq!(store.admit(&m, &keys).unwrap(), Admission::Stored);
+            let got = store.get(s.id().as_str()).unwrap().expect("promoted");
+            assert_eq!(got.payload, payload(2));
+            // Time spent held counts toward the age.
+            assert_eq!(got.age_ms, 5_000);
+            assert_eq!(store.pending.len(), 0);
+        }
+
+        #[test]
+        fn held_segment_is_dropped_after_hold_time() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let s = segment(&key, 0, payload(0));
+            assert_eq!(store.admit(&s, &keys).unwrap(), Admission::Held);
+            store.clock.advance(HOLD_SECS * 1000 - 1);
+            assert_eq!(store.reap_expired().unwrap(), 0);
+            assert_eq!(store.pending.len(), 1);
+            store.clock.advance(1);
+            assert_eq!(store.reap_expired().unwrap(), 1);
+            assert_eq!(store.pending.len(), 0);
+            let m = manifest_bundle(&key, &manifest(&key, 1, 0..3));
+            assert_eq!(store.admit(&m, &keys).unwrap(), Admission::Stored);
+            assert!(!is_stored(&store, &s));
+        }
+
+        #[test]
+        fn expired_hold_is_not_promoted_before_the_reaper_runs() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let s = segment(&key, 0, payload(0));
+            assert_eq!(store.admit(&s, &keys).unwrap(), Admission::Held);
+            store.clock.advance(HOLD_SECS * 1000);
+            let m = manifest_bundle(&key, &manifest(&key, 1, 0..3));
+            assert_eq!(store.admit(&m, &keys).unwrap(), Admission::Stored);
+            assert!(!is_stored(&store, &s));
+            assert_eq!(store.pending.len(), 0);
+        }
+
+        #[test]
+        fn resending_a_held_segment_does_not_extend_its_hold() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let s = segment(&key, 0, payload(0));
+            assert_eq!(store.admit(&s, &keys).unwrap(), Admission::Held);
+            store.clock.advance(HOLD_SECS * 1000 - 1);
+            assert_eq!(store.admit(&s, &keys).unwrap(), Admission::Held);
+            store.clock.advance(1);
+            assert_eq!(store.reap_expired().unwrap(), 1);
+        }
+
+        #[test]
+        fn segment_with_wrong_hash_is_rejected() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let m = manifest_bundle(&key, &manifest(&key, 1, 0..3));
+            assert_eq!(store.admit(&m, &keys).unwrap(), Admission::Stored);
+            let mut tampered = payload(1);
+            tampered[0] ^= 1;
+            let s = segment(&key, 1, tampered);
+            assert!(matches!(store.admit(&s, &keys).unwrap(), Admission::Rejected(_)));
+            assert!(!is_stored(&store, &s));
+            assert_eq!(store.pending.len(), 0);
+        }
+
+        #[test]
+        fn held_segment_with_wrong_hash_is_dropped_on_promotion() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let good = segment(&key, 0, payload(0));
+            let bad = segment(&key, 1, b"not segment 1".to_vec());
+            assert_eq!(store.admit(&good, &keys).unwrap(), Admission::Held);
+            assert_eq!(store.admit(&bad, &keys).unwrap(), Admission::Held);
+            let m = manifest_bundle(&key, &manifest(&key, 1, 0..3));
+            assert_eq!(store.admit(&m, &keys).unwrap(), Admission::Stored);
+            assert!(is_stored(&store, &good));
+            assert!(!is_stored(&store, &bad));
+            assert_eq!(store.pending.len(), 0);
+        }
+
+        #[test]
+        fn segment_not_in_manifest_is_rejected() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let m = manifest_bundle(&key, &manifest(&key, 1, 0..3));
+            assert_eq!(store.admit(&m, &keys).unwrap(), Admission::Stored);
+            let s = segment(&key, 7, payload(7));
+            assert!(matches!(store.admit(&s, &keys).unwrap(), Admission::Rejected(_)));
+            assert!(!is_stored(&store, &s));
+        }
+
+        #[test]
+        fn unpaired_publisher_is_rejected() {
+            let store = temp_store();
+            let stranger = PublisherKey::generate();
+            let keys = Keys(vec![PublisherKey::generate()]);
+            let m = manifest_bundle(&stranger, &manifest(&stranger, 1, 0..3));
+            let s = segment(&stranger, 0, payload(0));
+            assert!(matches!(store.admit(&s, &keys).unwrap(), Admission::Rejected(_)));
+            assert!(matches!(store.admit(&m, &keys).unwrap(), Admission::Rejected(_)));
+            assert!(store.all_ids().unwrap().is_empty());
+            assert_eq!(store.pending.len(), 0);
+        }
+
+        #[test]
+        fn manifest_for_another_publisher_or_content_is_rejected() {
+            let store = temp_store();
+            let (a, b) = (PublisherKey::generate(), PublisherKey::generate());
+            let keys = Keys(vec![a.clone(), b.clone()]);
+            // Signed and named by A, but carried in a bundle that claims B.
+            let m = manifest(&a, 1, 0..3);
+            let signed = SignedManifest::sign(&m, &a).unwrap().to_bytes().unwrap();
+            let wrong_publisher = Bundle::manifest(&b.key_id(), &m, signed.clone(), "node-a");
+            assert!(matches!(store.admit(&wrong_publisher, &keys).unwrap(), Admission::Rejected(_)));
+            let mut wrong_content = Bundle::manifest(&a.key_id(), &m, signed, "node-a");
+            wrong_content.info.content_id = "other".into();
+            assert!(matches!(store.admit(&wrong_content, &keys).unwrap(), Admission::Rejected(_)));
+            assert!(store.all_ids().unwrap().is_empty());
+        }
+
+        #[test]
+        fn hostile_manifest_payloads_are_rejected() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let m = manifest(&key, 1, 0..3);
+            let mut bad_sig = SignedManifest::sign(&m, &key).unwrap();
+            bad_sig.signature[0] ^= 1;
+            for junk in [vec![], b"\xff\x00garbage".to_vec(), bad_sig.to_bytes().unwrap()] {
+                let b = Bundle::manifest(&key.key_id(), &m, junk, "node-a");
+                assert!(matches!(store.admit(&b, &keys).unwrap(), Admission::Rejected(_)));
+            }
+            assert!(store.all_ids().unwrap().is_empty());
+        }
+
+        #[test]
+        fn bundle_expired_on_arrival_is_rejected() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let mut m = manifest_bundle(&key, &manifest(&key, 1, 0..3));
+            m.age_ms = m.lifetime_ms;
+            assert!(matches!(store.admit(&m, &keys).unwrap(), Admission::Rejected(_)));
+        }
+
+        #[test]
+        fn older_manifest_does_not_replace_newer() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let newer = manifest_bundle(&key, &manifest(&key, 2, 0..3));
+            assert_eq!(store.admit(&newer, &keys).unwrap(), Admission::Stored);
+            let older = manifest_bundle(&key, &manifest(&key, 1, 0..5));
+            assert_eq!(store.admit(&older, &keys).unwrap(), Admission::Duplicate);
+            // Same version with different contents is not newer either.
+            let equal = manifest_bundle(&key, &manifest(&key, 2, 0..5));
+            assert_eq!(store.admit(&equal, &keys).unwrap(), Admission::Duplicate);
+            assert_eq!(stored_version(&store, &key), 2);
+            // Segment 4 is listed only by the refused manifests.
+            let s = segment(&key, 4, payload(4));
+            assert!(matches!(store.admit(&s, &keys).unwrap(), Admission::Rejected(_)));
+        }
+
+        #[test]
+        fn newer_manifest_replaces_older() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let older = manifest_bundle(&key, &manifest(&key, 1, 0..3));
+            assert_eq!(store.admit(&older, &keys).unwrap(), Admission::Stored);
+            let newer = manifest_bundle(&key, &manifest(&key, 2, 0..5));
+            assert_eq!(store.admit(&newer, &keys).unwrap(), Admission::Stored);
+            assert_eq!(stored_version(&store, &key), 2);
+            assert_eq!(store.all_ids().unwrap().len(), 1);
+            let s = segment(&key, 4, payload(4));
+            assert_eq!(store.admit(&s, &keys).unwrap(), Admission::Stored);
+        }
     }
 }
 

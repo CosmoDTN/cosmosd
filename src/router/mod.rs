@@ -11,6 +11,9 @@
 //!      RFC 9171 bytes (`crate::wire`) inside a CBOR byte string.
 //!   4. Connection closes
 //!
+//! Every received bundle goes through `BundleStore::admit`, so a segment is
+//! kept only when a signed manifest from a trusted publisher vouches for it.
+//!
 //! Every read is bounded by `FRAME_TIMEOUT`, so a blackholed link fails the
 //! session instead of hanging it.
 
@@ -26,7 +29,8 @@ use tracing::{debug, info, warn};
 
 use crate::auth::authenticate_outgoing;
 use crate::codec::{self, PROTOCOL_VERSION};
-use crate::store::BundleStore;
+use crate::store::{Admission, BundleStore};
+use crate::trust::KeyLookup;
 use crate::wire;
 
 mod order;
@@ -113,11 +117,19 @@ pub struct EpidemicRouter {
     pub node_id: String,
     relay_port: u16,
     delay: Duration,
+    /// Publishers whose bundles we accept from peers.
+    trust: Arc<dyn KeyLookup + Send + Sync>,
 }
 
 impl EpidemicRouter {
-    pub fn new(store: Arc<BundleStore>, node_id: String, relay_port: u16, delay: Duration) -> Self {
-        EpidemicRouter { store, node_id, relay_port, delay }
+    pub fn new(
+        store: Arc<BundleStore>,
+        node_id: String,
+        relay_port: u16,
+        delay: Duration,
+        trust: Arc<dyn KeyLookup + Send + Sync>,
+    ) -> Self {
+        EpidemicRouter { store, node_id, relay_port, delay, trust }
     }
 
     /// Our manifest: every valid bundle we hold, with its priority.
@@ -182,8 +194,9 @@ impl EpidemicRouter {
         // 4. Send pull request
         send_frame(&mut stream, &codec::encode(&PullRequest { bundle_ids: missing.clone() })?).await?;
 
-        // 5. Receive requested bundles, storing each as it arrives
+        // 5. Receive requested bundles and pass each through the admission gate
         let mut received = 0usize;
+        let (mut held, mut rejected) = (Vec::new(), 0usize);
         for id in &missing {
             let raw = recv_frame(&mut stream).await?;
             if raw.is_empty() {
@@ -198,13 +211,32 @@ impl EpidemicRouter {
                     continue;
                 }
             };
-            if bundle.valid_on_arrival() {
-                self.store.insert(&bundle)?;
-                received += 1;
+            match self.store.admit(&bundle, &*self.trust)? {
+                Admission::Stored => received += 1,
+                Admission::Duplicate => debug!("Already have bundle {}", id),
+                Admission::Held => held.push(id),
+                Admission::Rejected(reason) => {
+                    warn!("Rejected bundle {} from {}: {}", id, peer_id, reason);
+                    rejected += 1;
+                }
             }
         }
+        // Held segments that a manifest later in this session promoted count as received.
+        let promoted = if held.is_empty() {
+            0
+        } else {
+            let ours = self.store.all_ids()?;
+            held.iter().filter(|id| ours.contains(id.as_str())).count()
+        };
+        received += promoted;
 
-        info!("Sync complete with {}: received {} bundles", peer_id, received);
+        info!(
+            "Sync complete with {}: received {} bundles, {} held for a manifest, {} rejected",
+            peer_id,
+            received,
+            held.len() - promoted,
+            rejected
+        );
         Ok(SyncStats { peer_node_id: peer_id, peer_relay_port: theirs.relay_port, received, sent: 0 })
     }
 
@@ -249,7 +281,17 @@ impl EpidemicRouter {
 mod tests {
     use super::*;
     use crate::bundle::{Bundle, Priority};
-    use crate::trust::KeyId;
+    use crate::trust::manifest::{Manifest as ContentManifest, SegmentEntry, SignedManifest};
+    use crate::trust::{KeyId, PublisherKey};
+
+    /// Trusts exactly the keys it holds.
+    struct Keys(Vec<PublisherKey>);
+
+    impl KeyLookup for Keys {
+        fn lookup(&self, id: &KeyId) -> Option<[u8; 32]> {
+            self.0.iter().find(|k| k.key_id() == *id).map(|k| k.public())
+        }
+    }
 
     /// A router on a temp store; keeps the tempdir alive as long as it is.
     struct TestRouter {
@@ -265,32 +307,110 @@ mod tests {
     }
 
     fn router(name: &str, port: u16) -> TestRouter {
+        router_trusting(name, port, vec![])
+    }
+
+    fn router_trusting(name: &str, port: u16, keys: Vec<PublisherKey>) -> TestRouter {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(BundleStore::open(dir.path().to_str().unwrap()).unwrap());
-        let router = EpidemicRouter::new(store, name.to_string(), port, Duration::from_secs(120));
+        let router = EpidemicRouter::new(store, name.to_string(), port, Duration::from_secs(120), Arc::new(Keys(keys)));
         TestRouter { router, _dir: dir }
     }
 
-    fn live_bundle(content: &str, seq: u32) -> Bundle {
-        let publisher = KeyId("0123456789abcdef".into());
-        Bundle::segment(&publisher, content, "Match", seq, "video/mp2t", Priority::Live, vec![seq as u8; 64], "ground")
+    fn live_payload(seq: u32) -> Vec<u8> {
+        vec![seq as u8; 64]
+    }
+
+    fn live_bundle(key: &PublisherKey, content: &str, seq: u32) -> Bundle {
+        Bundle::segment(&key.key_id(), content, "Match", seq, "video/mp2t", Priority::Live, live_payload(seq), "ground")
             .unwrap()
+    }
+
+    /// A signed live manifest listing `seqs` with their honest hashes.
+    fn live_manifest(key: &PublisherKey, content: &str, seqs: std::ops::Range<u32>) -> Bundle {
+        let m = ContentManifest {
+            publisher: key.key_id(),
+            content_id: content.into(),
+            title: "Match".into(),
+            version: 1,
+            created_at_ms: 1_700_000_000_000,
+            live: true,
+            segments: seqs
+                .map(|s| SegmentEntry { sequence: s, hash: *blake3::hash(&live_payload(s)).as_bytes(), duration_ms: 10_000 })
+                .collect(),
+        };
+        let signed = SignedManifest::sign(&m, key).unwrap().to_bytes().unwrap();
+        Bundle::manifest(&key.key_id(), &m, signed, "ground")
     }
 
     #[tokio::test]
     async fn sync_pulls_missing_bundles() {
+        let key = PublisherKey::generate();
         let ground = router("ground", 17778);
-        let gateway = router("gateway", 27778);
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        ground.store.insert(&live_manifest(&key, "m", 0..3)).unwrap();
         for s in 0..3 {
-            ground.store.insert(&live_bundle("m", s)).unwrap();
+            ground.store.insert(&live_bundle(&key, "m", s)).unwrap();
         }
         let (a, b) = tokio::io::duplex(1 << 20);
         let (got, served) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
-        assert_eq!(got.unwrap().received, 3);
-        assert_eq!(served.unwrap().sent, 3);
-        let got = gateway.store.get("0123456789abcdef/m/00002").unwrap().expect("pulled bundle");
-        assert_eq!(got.payload, vec![2u8; 64]);
+        // Three segments (held, then promoted by the manifest) plus the manifest.
+        assert_eq!(got.unwrap().received, 4);
+        assert_eq!(served.unwrap().sent, 4);
+        let id = format!("{}/m/00002", key.key_id());
+        let got = gateway.store.get(&id).unwrap().expect("pulled bundle");
+        assert_eq!(got.payload, live_payload(2));
         assert_eq!(got.info.sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn router_rejects_tampered_segment_over_a_real_sync() {
+        let key = PublisherKey::generate();
+        let ground = router("ground", 17778);
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        let tampered = |seq: u32| {
+            let mut b = live_bundle(&key, "m", seq);
+            b.payload[10] ^= 0x01;
+            b
+        };
+
+        // The manifest lists 0..4 with honest hashes. Segment 2 is flipped on
+        // the sending side. The first session pulls the segments before the
+        // manifest, so they are held and then checked on promotion.
+        ground.store.insert(&live_manifest(&key, "m", 0..4)).unwrap();
+        for s in 0..2 {
+            ground.store.insert(&live_bundle(&key, "m", s)).unwrap();
+        }
+        ground.store.insert(&tampered(2)).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (got, _) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
+        assert_eq!(got.unwrap().received, 3);
+
+        // The manifest is now in place on the receiver. Segment 3 arrives
+        // flipped and must be refused straight away.
+        ground.store.insert(&tampered(3)).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (got, _) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
+        assert_eq!(got.unwrap().received, 0);
+
+        let id = |s: u32| format!("{}/m/{:05}", key.key_id(), s);
+        assert!(gateway.store.get(&id(0)).unwrap().is_some());
+        assert!(gateway.store.get(&id(1)).unwrap().is_some());
+        assert!(gateway.store.get(&id(2)).unwrap().is_none(), "tampered held segment stored");
+        assert!(gateway.store.get(&id(3)).unwrap().is_none(), "tampered segment stored");
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_unpaired_publisher() {
+        let key = PublisherKey::generate();
+        let ground = router("ground", 17778);
+        let gateway = router("gateway", 27778);
+        ground.store.insert(&live_manifest(&key, "m", 0..1)).unwrap();
+        ground.store.insert(&live_bundle(&key, "m", 0)).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (got, _) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
+        assert_eq!(got.unwrap().received, 0);
+        assert!(gateway.store.all_ids().unwrap().is_empty());
     }
 
     #[tokio::test]

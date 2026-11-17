@@ -25,7 +25,6 @@ mod peer;
 mod router;
 mod store;
 mod transport;
-// Trust and KeyLookup are used by the bundle verifier from Task 2 onward.
 mod trust;
 mod wire;
 
@@ -108,6 +107,11 @@ enum Command {
         /// Seconds between syncs with a healthy peer.
         #[arg(long, default_value = "5")]
         sync_interval: u64,
+
+        /// Key directory (default $HOME/.config/cosmosd). Bundles from peers
+        /// are accepted only from this node's key and the keys paired here.
+        #[arg(long)]
+        key_dir: Option<PathBuf>,
     },
 
     /// Ingest a local video file, or a live stream (--live), into the running
@@ -178,8 +182,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval } => {
-            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval).await?;
+        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval, key_dir } => {
+            let key_dir = match key_dir {
+                Some(d) => d,
+                None => default_key_dir()?,
+            };
+            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval, key_dir).await?;
         }
         Command::Ingest { file, live, content_id, title, daemon, priority, max_bitrate } => {
             match (file, live) {
@@ -254,6 +262,7 @@ async fn serve(
     bind: String,
     delay: u64,
     sync_interval: u64,
+    key_dir: PathBuf,
 ) -> Result<()> {
     let node_id = node_id.unwrap_or_else(|| {
         hostname::get()
@@ -271,6 +280,7 @@ async fn serve(
 
     let peers = initial_peers.iter().map(|a| auth::parse_peer(a)).collect::<Result<Vec<_>>>()?;
     let store = Arc::new(BundleStore::open(&store_path)?);
+    let trust = load_trust(&key_dir)?;
 
     // 1. Relay auth
     let relay_auth = Arc::new(RelayAuth::new(relay_token));
@@ -281,6 +291,7 @@ async fn serve(
         node_id.clone(),
         relay_port,
         std::time::Duration::from_secs(delay),
+        trust,
     ));
 
     // 3. Peer manager — outgoing sync + incoming relay
@@ -360,6 +371,19 @@ async fn serve(
     flush_store.flush_clock()?;
     info!("Store clock flushed, shutting down");
     Ok(())
+}
+
+/// The node's own key, if it has one, plus the keys paired in `key_dir`. A
+/// missing key dir gives a node that trusts nobody.
+fn load_trust(key_dir: &std::path::Path) -> Result<Arc<trust::Trust>> {
+    let own = trust::PublisherKey::load_if_present(key_dir)?;
+    let paired = trust::PairedKeys::open(key_dir)?;
+    match &own {
+        Some(k) => info!("Publisher key: {}", k.key_id()),
+        None => info!("Publisher key: none in {}", key_dir.display()),
+    }
+    info!("Paired keys:   {}", paired.list().len());
+    Ok(Arc::new(trust::Trust::new(own, paired)))
 }
 
 /// Resolves on Ctrl+C or, on unix, SIGTERM.

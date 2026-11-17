@@ -1,6 +1,6 @@
 //! TCP convergence layer — reference implementation.
 //!
-//! Bundles are sent as length-prefixed JSON frames over a TCP stream.
+//! Bundles are sent as length-prefixed RFC 9171 bytes over a TCP stream.
 //! Production deployments should use Reticulum or LoRa for disconnected links;
 //! TCP is for LAN demos and testing.
 
@@ -12,6 +12,7 @@ use tracing::{debug, info};
 
 use super::{BundleListener, BundleStream, ConvergenceLayer, PeerAddr};
 use crate::bundle::Bundle;
+use crate::wire::{decode_bundle, encode_bundle};
 
 // === TCP stream ===
 
@@ -23,11 +24,11 @@ pub struct TcpBundleStream {
 #[async_trait]
 impl BundleStream for TcpBundleStream {
     async fn send(&mut self, bundle: &Bundle) -> Result<()> {
-        let data = serde_json::to_vec(bundle)?;
+        let data = encode_bundle(bundle)?;
         let len = data.len() as u32;
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(&data).await?;
-        debug!("Sent bundle {} to {}", bundle.id, self.peer);
+        debug!("Sent bundle {} to {}", bundle.id(), self.peer);
         Ok(())
     }
 
@@ -48,8 +49,8 @@ impl BundleStream for TcpBundleStream {
 
         let mut buf = vec![0u8; len];
         self.stream.read_exact(&mut buf).await?;
-        let bundle: Bundle = serde_json::from_slice(&buf)?;
-        debug!("Received bundle {} from {}", bundle.id, self.peer);
+        let bundle = decode_bundle(&buf)?;
+        debug!("Received bundle {} from {}", bundle.id(), self.peer);
         Ok(Some(bundle))
     }
 

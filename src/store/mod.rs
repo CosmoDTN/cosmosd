@@ -1,22 +1,22 @@
 //! Content-addressed bundle store backed by sled (embedded key-value DB).
 //!
-//! Bundles are keyed by their BundleId string and stored as CBOR. A second
-//! tree, `meta`, holds each bundle's payload-free metadata so listing, the
-//! catalog and manifests never decode a payload. Expired bundles are purged
-//! lazily on read and periodically by the background reaper task.
+//! Bundles are keyed by their BundleId string and stored as RFC 9171 bytes.
+//! A second tree, `meta`, holds each bundle's payload-free metadata so
+//! listing, the catalog and manifests never decode a payload. Expired bundles
+//! are purged lazily on read and periodically by the background reaper task.
 
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
 use sled::Transactional;
-use chrono::Utc;
 use tracing::{debug, info};
 
-use crate::bundle::{Bundle, BundleMeta};
+use crate::bundle::{Bundle, BundleKind, BundleMeta};
 use crate::codec::{decode, encode};
+use crate::wire::{decode_bundle, encode_bundle};
 
 pub struct BundleStore {
-    /// id -> CBOR `Bundle` (payload included).
+    /// id -> RFC 9171 bundle bytes (payload included).
     db: sled::Db,
     /// id -> CBOR `BundleMeta`.
     meta: sled::Tree,
@@ -39,8 +39,9 @@ impl BundleStore {
     /// Insert a bundle. Returns false if a valid copy is already present
     /// (dedup by BundleId); an expired copy is overwritten.
     pub fn insert(&self, bundle: &Bundle) -> Result<bool> {
-        let key = bundle.id.as_str().as_bytes();
-        let value = encode(bundle)?;
+        let id = bundle.id();
+        let key = id.as_str().as_bytes();
+        let value = encode_bundle(bundle)?;
         let meta_value = encode(&bundle.meta())?;
         // Both trees in one transaction, with the dedup check inside it, so a
         // crash can't leave a payload without its meta entry. An expired (or
@@ -60,9 +61,9 @@ impl BundleStore {
             })
             .map_err(|e| anyhow::anyhow!("bundle insert transaction: {e:?}"))?;
         if inserted {
-            debug!("Stored bundle: {}", bundle.id);
+            debug!("Stored bundle: {}", id);
         } else {
-            debug!("Duplicate bundle ignored: {}", bundle.id);
+            debug!("Duplicate bundle ignored: {}", id);
         }
         Ok(inserted)
     }
@@ -72,7 +73,7 @@ impl BundleStore {
         let Some(raw) = self.db.get(id.as_bytes())? else {
             return Ok(None);
         };
-        let bundle: Bundle = decode(&raw)?;
+        let bundle = decode_bundle(&raw)?;
         if !bundle.is_valid() {
             self.db.remove(id.as_bytes())?;
             self.meta.remove(id.as_bytes())?;
@@ -94,17 +95,14 @@ impl BundleStore {
         Ok(out)
     }
 
-    /// Metadata of the valid bundles of one content ID, ascending by sequence.
+    /// Metadata of the valid segments of one content ID, ascending by
+    /// sequence. Matches every publisher until the API takes a publisher.
     pub fn list_meta(&self, content_id: &str) -> Result<Vec<BundleMeta>> {
-        let prefix = format!("{}/", content_id);
-        let mut out = Vec::new();
-        for item in self.meta.scan_prefix(prefix.as_bytes()) {
-            let (_, value) = item?;
-            let m: BundleMeta = decode(&value)?;
-            if m.is_valid() {
-                out.push(m);
-            }
-        }
+        let mut out: Vec<BundleMeta> = self
+            .all_meta()?
+            .into_iter()
+            .filter(|m| m.kind == BundleKind::Segment && m.content_id == content_id)
+            .collect();
         out.sort_by_key(|m| m.sequence);
         Ok(out)
     }
@@ -113,14 +111,13 @@ impl BundleStore {
     pub fn catalog(&self) -> Result<Vec<ContentSummary>> {
         let mut map: HashMap<String, ContentSummary> = HashMap::new();
 
-        for m in self.all_meta()? {
+        for m in self.all_meta()?.into_iter().filter(|m| m.kind == BundleKind::Segment) {
             let entry = map.entry(m.content_id.clone()).or_insert_with(|| ContentSummary {
                 content_id: m.content_id.clone(),
-                title: m.content_title.clone(),
+                title: m.title.clone(),
                 priority: m.priority,
                 segment_count: 0,
                 last_sequence: m.sequence,
-                expires_at: m.expires_at,
             });
             entry.segment_count += 1;
             entry.last_sequence = entry.last_sequence.max(m.sequence);
@@ -161,15 +158,26 @@ impl BundleStore {
 mod tests {
     use super::*;
     use crate::bundle::Priority;
+    use crate::trust::KeyId;
 
     fn make_bundle(content_id: &str, sequence: u32) -> Bundle {
-        Bundle::new(content_id, "Test Video", sequence, "video/mp2t", Priority::Vod, b"data".to_vec(), "node-a")
+        let publisher = KeyId("0123456789abcdef".into());
+        Bundle::segment(&publisher, content_id, "Test Video", sequence, "video/mp2t", Priority::Vod, b"data".to_vec(), "node-a")
+            .unwrap()
+    }
+
+    /// A bundle whose age has reached its lifetime.
+    fn expired_bundle(content_id: &str, sequence: u32) -> Bundle {
+        let mut b = make_bundle(content_id, sequence);
+        b.age_ms = b.lifetime_ms;
+        b
     }
 
     /// Write a bundle to both trees without the validity checks `insert` skips.
     fn insert_raw(store: &BundleStore, b: &Bundle) {
-        store.db.insert(b.id.as_str().as_bytes(), encode(b).unwrap()).unwrap();
-        store.meta.insert(b.id.as_str().as_bytes(), encode(&b.meta()).unwrap()).unwrap();
+        let id = b.id();
+        store.db.insert(id.as_str().as_bytes(), encode_bundle(b).unwrap()).unwrap();
+        store.meta.insert(id.as_str().as_bytes(), encode(&b.meta()).unwrap()).unwrap();
     }
 
     fn temp_store() -> BundleStore {
@@ -182,8 +190,8 @@ mod tests {
         let store = temp_store();
         let b = make_bundle("show_a", 0);
         assert!(store.insert(&b).unwrap());
-        let got = store.get(b.id.as_str()).unwrap().unwrap();
-        assert_eq!(got.id, b.id);
+        let got = store.get(b.id().as_str()).unwrap().unwrap();
+        assert_eq!(got, b);
     }
 
     #[test]
@@ -191,7 +199,8 @@ mod tests {
         let store = temp_store();
         let b = make_bundle("show_a", 0);
         assert!(store.insert(&b).unwrap());
-        let id = b.id.as_str();
+        let id = b.id();
+        let id = id.as_str();
         let (db_raw, meta_raw) = (store.db.get(id).unwrap().unwrap(), store.meta.get(id).unwrap().unwrap());
         assert!(!store.insert(&b).unwrap());
         assert_eq!(store.db.get(id).unwrap().unwrap(), db_raw);
@@ -210,16 +219,15 @@ mod tests {
     #[test]
     fn get_returns_none_for_missing() {
         let store = temp_store();
-        assert!(store.get("missing/00000").unwrap().is_none());
+        assert!(store.get("0123456789abcdef/missing/00000").unwrap().is_none());
     }
 
     #[test]
     fn get_returns_none_for_expired() {
         let store = temp_store();
-        let mut b = make_bundle("show_a", 0);
-        b.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        let b = expired_bundle("show_a", 0);
         insert_raw(&store, &b);
-        assert!(store.get(b.id.as_str()).unwrap().is_none());
+        assert!(store.get(b.id().as_str()).unwrap().is_none());
     }
 
     #[test]
@@ -254,18 +262,17 @@ mod tests {
         store.insert(&make_bundle("show_a", 1)).unwrap();
         let ids = store.all_ids().unwrap();
         assert_eq!(ids.len(), 2);
-        assert!(ids.contains("show_a/00000"));
-        assert!(ids.contains("show_a/00001"));
+        assert!(ids.contains("0123456789abcdef/show_a/00000"));
+        assert!(ids.contains("0123456789abcdef/show_a/00001"));
     }
 
     #[test]
     fn reap_expired_removes_stale_bundles() {
         let store = temp_store();
-        let mut b = make_bundle("show_a", 0);
-        b.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        let b = expired_bundle("show_a", 0);
         insert_raw(&store, &b);
         assert_eq!(store.reap_expired().unwrap(), 1);
-        assert!(store.get(b.id.as_str()).unwrap().is_none());
+        assert!(store.get(b.id().as_str()).unwrap().is_none());
     }
 
     #[test]
@@ -297,25 +304,23 @@ mod tests {
     #[test]
     fn insert_replaces_expired_entry() {
         let store = temp_store();
-        let mut old = make_bundle("show_a", 0);
-        old.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        let old = expired_bundle("show_a", 0);
         insert_raw(&store, &old);
         let fresh = make_bundle("show_a", 0);
         assert!(store.insert(&fresh).unwrap());
-        let got = store.get(fresh.id.as_str()).unwrap().expect("fresh bundle readable");
-        assert_eq!(got.expires_at, fresh.expires_at);
+        let got = store.get(fresh.id().as_str()).unwrap().expect("fresh bundle readable");
+        assert_eq!(got.age_ms, 0);
         assert_eq!(store.list_meta("show_a").unwrap().len(), 1);
     }
 
     #[test]
     fn reap_removes_payload_and_meta() {
         let store = temp_store();
-        let mut b = make_bundle("show_a", 0);
-        b.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        let b = expired_bundle("show_a", 0);
         insert_raw(&store, &b);
         assert_eq!(store.reap_expired().unwrap(), 1);
-        assert!(store.db.get(b.id.as_str()).unwrap().is_none());
-        assert!(store.meta.get(b.id.as_str()).unwrap().is_none());
+        assert!(store.db.get(b.id().as_str()).unwrap().is_none());
+        assert!(store.meta.get(b.id().as_str()).unwrap().is_none());
     }
 }
 
@@ -326,5 +331,4 @@ pub struct ContentSummary {
     pub priority: crate::bundle::Priority,
     pub segment_count: u32,
     pub last_sequence: u32,
-    pub expires_at: chrono::DateTime<Utc>,
 }

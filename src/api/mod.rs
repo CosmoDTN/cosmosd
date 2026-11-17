@@ -22,9 +22,14 @@ use crate::{
     bundle::{Bundle, Priority},
     peer::PeerManager,
     store::BundleStore,
+    trust::KeyId,
 };
 
 mod playlist;
+
+/// Publisher for `POST /ingest` until ingest signs under the node's key.
+/// Not a real key ID. Every node uses the same value for now.
+const UNSIGNED_PUBLISHER: &str = "unsigned";
 
 // === App state ===
 
@@ -142,17 +147,15 @@ async fn hls_segment_handler(
     State(state): State<ApiState>,
     Path((content_id, sequence)): Path<(String, u32)>,
 ) -> Result<Response, ApiError> {
-    let bundle_id = format!("{}/{:05}", content_id, sequence);
-    let Some(bundle) = state.store.get(&bundle_id)? else {
+    let meta = state.store.list_meta(&content_id)?.into_iter().find(|m| m.sequence == sequence);
+    let Some(bundle) = meta.map(|m| state.store.get(&m.id)).transpose()?.flatten() else {
         return Ok((StatusCode::NOT_FOUND, "Segment not found").into_response());
     };
-    if !bundle.verify() {
-        return Ok((StatusCode::INTERNAL_SERVER_ERROR, "Integrity check failed").into_response());
-    }
+    let created_at = chrono::DateTime::from_timestamp_millis(bundle.info.created_at_ms).unwrap_or_default();
     Ok((
         [
             ("Content-Type", "video/mp2t".to_string()),
-            ("x-cosmosd-created-at", bundle.created_at.to_rfc3339()),
+            ("x-cosmosd-created-at", created_at.to_rfc3339()),
         ],
         bundle.payload,
     )
@@ -235,7 +238,8 @@ async fn ingest(
         .decode(&req.payload_b64)
         .map_err(|e| anyhow::anyhow!("Invalid base64: {}", e))?;
 
-    let bundle = Bundle::new(
+    let bundle = Bundle::segment(
+        &KeyId(UNSIGNED_PUBLISHER.into()),
         &req.content_id,
         &req.content_title,
         req.sequence,
@@ -243,9 +247,9 @@ async fn ingest(
         req.priority,
         payload,
         &state.node_id,
-    )
+    )?
     .with_duration_ms(req.duration_ms);
-    let bundle_id = bundle.id.to_string();
+    let bundle_id = bundle.id().to_string();
     let stored = state.store.insert(&bundle)?;
 
     info!("Ingest: {} (stored={})", bundle_id, stored);

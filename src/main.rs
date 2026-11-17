@@ -27,6 +27,7 @@ mod store;
 mod transport;
 // Trust and KeyLookup are used by the bundle verifier from Task 2 onward.
 mod trust;
+mod wire;
 
 use std::path::PathBuf;
 use std::sync::Arc;

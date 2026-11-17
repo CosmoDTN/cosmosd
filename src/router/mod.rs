@@ -4,10 +4,11 @@
 //! each has), compute the diff, and pull missing bundles. This is how
 //! content spreads through the mesh without any central coordination.
 //!
-//! Protocol v2 (CBOR frames, over any stream on the relay port):
+//! Protocol v3 (CBOR frames, over any stream on the relay port):
 //!   1. Both sides send their manifest (version, relay port, id + priority)
 //!   2. Initiator orders the diff live-first and sends a pull request
-//!   3. Responder streams requested bundles, in that order
+//!   3. Responder streams requested bundles, in that order. Each bundle is
+//!      RFC 9171 bytes (`crate::wire`) inside a CBOR byte string.
 //!   4. Connection closes
 //!
 //! Every read is bounded by `FRAME_TIMEOUT`, so a blackholed link fails the
@@ -24,9 +25,9 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::auth::authenticate_outgoing;
-use crate::bundle::Bundle;
 use crate::codec::{self, PROTOCOL_VERSION};
 use crate::store::BundleStore;
+use crate::wire;
 
 mod order;
 pub use order::*;
@@ -189,17 +190,14 @@ impl EpidemicRouter {
                 debug!("Peer {} doesn't have bundle {}", peer_id, id);
                 continue;
             }
-            let bundle: Bundle = match codec::decode(&raw) {
+            let decoded = codec::decode::<serde_bytes::ByteBuf>(&raw).and_then(|bytes| wire::decode_bundle(&bytes));
+            let bundle = match decoded {
                 Ok(b) => b,
                 Err(e) => {
                     warn!("Bad bundle {} from {}: {}", id, peer_id, e);
                     continue;
                 }
             };
-            if !bundle.verify() {
-                warn!("Integrity check failed for bundle {} from {}", id, peer_id);
-                continue;
-            }
             if bundle.is_valid() {
                 self.store.insert(&bundle)?;
                 received += 1;
@@ -232,7 +230,8 @@ impl EpidemicRouter {
         for id in &pull.bundle_ids {
             match self.store.get(id)? {
                 Some(bundle) => {
-                    send_frame(&mut stream, &codec::encode(&bundle)?).await?;
+                    let bytes = wire::encode_bundle(&bundle)?;
+                    send_frame(&mut stream, &codec::encode(&serde_bytes::Bytes::new(&bytes))?).await?;
                     sent += 1;
                 }
                 None => {
@@ -249,7 +248,8 @@ impl EpidemicRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::Priority;
+    use crate::bundle::{Bundle, Priority};
+    use crate::trust::KeyId;
 
     /// A router on a temp store; keeps the tempdir alive as long as it is.
     struct TestRouter {
@@ -272,7 +272,9 @@ mod tests {
     }
 
     fn live_bundle(content: &str, seq: u32) -> Bundle {
-        Bundle::new(content, "Match", seq, "video/mp2t", Priority::Live, vec![seq as u8; 64], "ground")
+        let publisher = KeyId("0123456789abcdef".into());
+        Bundle::segment(&publisher, content, "Match", seq, "video/mp2t", Priority::Live, vec![seq as u8; 64], "ground")
+            .unwrap()
     }
 
     #[tokio::test]
@@ -286,7 +288,9 @@ mod tests {
         let (got, served) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
         assert_eq!(got.unwrap().received, 3);
         assert_eq!(served.unwrap().sent, 3);
-        assert!(gateway.store.get("m/00002").unwrap().is_some());
+        let got = gateway.store.get("0123456789abcdef/m/00002").unwrap().expect("pulled bundle");
+        assert_eq!(got.payload, vec![2u8; 64]);
+        assert_eq!(got.info.sequence, 2);
     }
 
     #[tokio::test]
@@ -310,7 +314,7 @@ mod tests {
             b
         });
         let err = gateway.initiate(a).await.unwrap_err().to_string();
-        assert!(err.contains("protocol") && err.contains('1') && err.contains('2'), "{}", err);
+        assert!(err.contains("v1") && err.contains("v3"), "{}", err);
         drop(peer.await);
     }
 

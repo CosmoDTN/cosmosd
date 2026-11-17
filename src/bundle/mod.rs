@@ -1,14 +1,19 @@
-//! BPv7-inspired bundle format for CosmosD.
+//! Bundles for CosmosD, keyed by publisher.
 //!
-//! A Bundle wraps one HLS segment (or a playlist) with routing metadata.
-//! Full BPv7 (RFC 9171) compatibility is a future goal; this is a working subset.
+//! A Bundle carries one HLS segment or one signed manifest, plus the routing
+//! fields cosmosd needs. `crate::wire` turns it into RFC 9171 bytes and back.
+//! The payload hash is not stored here. It lives in the signed manifest.
 
-use chrono::{DateTime, Utc};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+
+use crate::trust::{manifest::Manifest, KeyId};
 
 /// Default HLS segment duration in milliseconds.
 pub const DEFAULT_SEGMENT_MS: u32 = 10_000;
+
+/// MIME type of a manifest bundle's payload (a CBOR `SignedManifest`).
+pub const MANIFEST_MIME: &str = "application/vnd.cosmos.manifest+cbor";
 
 // === Priority ===
 
@@ -32,18 +37,64 @@ impl Priority {
             Priority::Vod => 2_592_000,    // 30 days
         }
     }
+
+    /// Bundle lifetime in milliseconds, as stored in the primary block.
+    pub fn lifetime_ms(&self) -> u64 {
+        self.default_ttl_secs() as u64 * 1000
+    }
+}
+
+// === Content info ===
+
+/// What a bundle carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleKind {
+    Segment,
+    Manifest,
+}
+
+/// The fields of the private content block (type 192).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContentInfo {
+    pub kind: BundleKind,
+    /// Chosen by the publisher. Unique only within that publisher.
+    pub content_id: String,
+    pub title: String,
+    pub sequence: u32,
+    pub duration_ms: u32,
+    pub mime_type: String,
+    pub priority: Priority,
+    /// Publisher wall-clock time. Used for the live playlist edge, never for expiry.
+    pub created_at_ms: i64,
+}
+
+/// A content ID must be non-empty and free of `/`, since it is one URI segment.
+pub fn check_content_id(content_id: &str) -> Result<()> {
+    if content_id.is_empty() {
+        bail!("content id must not be empty");
+    }
+    if content_id.contains('/') {
+        bail!("content id {content_id:?} must not contain '/'");
+    }
+    Ok(())
 }
 
 // === Bundle ID ===
 
-/// Globally unique identifier for a bundle (content-addressed).
-/// Format: `<content_id>/<sequence>` e.g. `ipl_2026_03_07/00042`
+/// Store and sync identifier for a bundle.
+/// Format: `<publisher>/<content_id>/<sequence:05>` for segments and
+/// `<publisher>/<content_id>/manifest` for manifests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BundleId(pub String);
 
 impl BundleId {
-    pub fn new(content_id: &str, sequence: u32) -> Self {
-        BundleId(format!("{}/{:05}", content_id, sequence))
+    pub fn segment(publisher: &KeyId, content_id: &str, sequence: u32) -> Self {
+        BundleId(format!("{}/{}/{:05}", publisher, content_id, sequence))
+    }
+
+    pub fn manifest(publisher: &KeyId, content_id: &str) -> Self {
+        BundleId(format!("{}/{}/manifest", publisher, content_id))
     }
 
     pub fn as_str(&self) -> &str {
@@ -59,115 +110,113 @@ impl std::fmt::Display for BundleId {
 
 // === Bundle ===
 
-/// A single transmissible unit — one HLS segment or playlist file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A single transmissible unit. It holds one HLS segment or one signed manifest.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Bundle {
-    /// Unique ID for this bundle.
-    pub id: BundleId,
-
-    /// Human-readable content title (e.g. "IPL 2026 — MI vs CSK").
-    pub content_title: String,
-
-    /// Sequence number within the content stream (segment index).
-    pub sequence: u32,
-
-    /// MIME type: `video/mp2t` for .ts segments, `application/x-mpegURL` for playlists.
-    pub mime_type: String,
-
-    /// Delivery priority.
-    pub priority: Priority,
-
-    /// Wall-clock time when this bundle expires and should be discarded.
-    pub expires_at: DateTime<Utc>,
-
-    /// blake3 hash of `payload` for integrity verification.
-    pub payload_hash: String,
-
-    /// Wall-clock time when this bundle was created.
-    pub created_at: DateTime<Utc>,
-
-    /// Playback duration of the segment in milliseconds.
-    pub duration_ms: u32,
-
-    /// Raw bytes — one HLS .ts segment or .m3u8 playlist.
-    #[serde(with = "serde_bytes")]
+    /// Key ID of the publisher that owns the content.
+    pub publisher: KeyId,
+    pub info: ContentInfo,
+    /// Raw bytes of one HLS segment or of a CBOR `SignedManifest`.
     pub payload: Vec<u8>,
-
-    /// Node that originally created this bundle.
-    pub source_node: String,
-
+    /// Time the bundle has existed, summed over the nodes that held it.
+    pub age_ms: u64,
+    pub lifetime_ms: u64,
     /// Transmission hop count (incremented at each relay).
     pub hop_count: u8,
-
-    /// Internal UUID for deduplication across nodes.
-    pub bundle_uuid: Uuid,
+    /// Node that last forwarded this bundle, if any.
+    pub previous_node: Option<String>,
+    /// Node that originally created this bundle.
+    pub source_node: String,
 }
 
 impl Bundle {
-    pub fn new(
+    /// A segment bundle. Errors when `content_id` is empty or contains `/`.
+    pub fn segment(
+        publisher: &KeyId,
         content_id: &str,
-        content_title: &str,
+        title: &str,
         sequence: u32,
-        mime_type: &str,
+        mime: &str,
         priority: Priority,
         payload: Vec<u8>,
         source_node: &str,
-    ) -> Self {
-        let hash = blake3::hash(&payload).to_hex().to_string();
-        let created_at = Utc::now();
-        let expires_at = created_at + chrono::Duration::seconds(priority.default_ttl_secs());
-
-        Bundle {
-            id: BundleId::new(content_id, sequence),
-            content_title: content_title.to_string(),
+    ) -> Result<Bundle> {
+        check_content_id(content_id)?;
+        let info = ContentInfo {
+            kind: BundleKind::Segment,
+            content_id: content_id.to_string(),
+            title: title.to_string(),
             sequence,
-            mime_type: mime_type.to_string(),
-            priority,
-            expires_at,
-            created_at,
             duration_ms: DEFAULT_SEGMENT_MS,
-            payload_hash: hash,
+            mime_type: mime.to_string(),
+            priority,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        Ok(Bundle::fresh(publisher, info, payload, source_node))
+    }
+
+    /// A manifest bundle carrying `signed_bytes`, a CBOR `SignedManifest`.
+    /// Live manifests get the live lifetime, others the VOD lifetime.
+    pub fn manifest(publisher: &KeyId, m: &Manifest, signed_bytes: Vec<u8>, source_node: &str) -> Bundle {
+        let info = ContentInfo {
+            kind: BundleKind::Manifest,
+            content_id: m.content_id.clone(),
+            title: m.title.clone(),
+            sequence: 0,
+            duration_ms: 0,
+            mime_type: MANIFEST_MIME.to_string(),
+            priority: if m.live { Priority::Live } else { Priority::Vod },
+            created_at_ms: m.created_at_ms,
+        };
+        Bundle::fresh(publisher, info, signed_bytes, source_node)
+    }
+
+    fn fresh(publisher: &KeyId, info: ContentInfo, payload: Vec<u8>, source_node: &str) -> Bundle {
+        Bundle {
+            publisher: publisher.clone(),
+            lifetime_ms: info.priority.lifetime_ms(),
+            info,
             payload,
-            source_node: source_node.to_string(),
+            age_ms: 0,
             hop_count: 0,
-            bundle_uuid: Uuid::new_v4(),
+            previous_node: None,
+            source_node: source_node.to_string(),
         }
     }
 
     /// Set the segment playback duration.
     pub fn with_duration_ms(mut self, ms: u32) -> Self {
-        self.duration_ms = ms;
+        self.info.duration_ms = ms;
         self
     }
 
-    /// The content stream this bundle belongs to (the id before the last `/`).
-    pub fn content_id(&self) -> &str {
-        self.id.as_str().rsplit_once('/').map_or(self.id.as_str(), |(c, _)| c)
+    pub fn id(&self) -> BundleId {
+        match self.info.kind {
+            BundleKind::Segment => BundleId::segment(&self.publisher, &self.info.content_id, self.info.sequence),
+            BundleKind::Manifest => BundleId::manifest(&self.publisher, &self.info.content_id),
+        }
     }
 
     /// Routing fields without the payload.
     pub fn meta(&self) -> BundleMeta {
         BundleMeta {
-            id: self.id.0.clone(),
-            content_id: self.content_id().to_string(),
-            content_title: self.content_title.clone(),
-            sequence: self.sequence,
-            priority: self.priority,
-            created_at: self.created_at,
-            expires_at: self.expires_at,
-            duration_ms: self.duration_ms,
+            id: self.id().0,
+            publisher: self.publisher.clone(),
+            content_id: self.info.content_id.clone(),
+            title: self.info.title.clone(),
+            sequence: self.info.sequence,
+            kind: self.info.kind,
+            priority: self.info.priority,
+            created_at_ms: self.info.created_at_ms,
+            duration_ms: self.info.duration_ms,
+            lifetime_ms: self.lifetime_ms,
+            age_ms: self.age_ms,
         }
     }
 
-    /// Returns true if this bundle has not yet expired.
+    /// True while the bundle's age is below its lifetime.
     pub fn is_valid(&self) -> bool {
-        Utc::now() < self.expires_at
-    }
-
-    /// Returns true if payload integrity check passes.
-    pub fn verify(&self) -> bool {
-        let actual = blake3::hash(&self.payload).to_hex().to_string();
-        actual == self.payload_hash
+        self.age_ms < self.lifetime_ms
     }
 }
 
@@ -177,19 +226,22 @@ impl Bundle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BundleMeta {
     pub id: String,
+    pub publisher: KeyId,
     pub content_id: String,
-    pub content_title: String,
+    pub title: String,
     pub sequence: u32,
+    pub kind: BundleKind,
     pub priority: Priority,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub created_at_ms: i64,
     pub duration_ms: u32,
+    pub lifetime_ms: u64,
+    pub age_ms: u64,
 }
 
 impl BundleMeta {
-    /// Returns true if the bundle has not yet expired.
+    /// True while the bundle's age is below its lifetime.
     pub fn is_valid(&self) -> bool {
-        Utc::now() < self.expires_at
+        self.age_ms < self.lifetime_ms
     }
 }
 
@@ -197,44 +249,53 @@ impl BundleMeta {
 mod tests {
     use super::*;
 
+    fn publisher() -> KeyId {
+        KeyId("0123456789abcdef".into())
+    }
+
     fn make_bundle(priority: Priority) -> Bundle {
-        Bundle::new("test_content", "Test Video", 0, "video/mp2t", priority, b"hello".to_vec(), "node-a")
+        Bundle::segment(&publisher(), "test_content", "Test Video", 0, "video/mp2t", priority, b"hello".to_vec(), "node-a")
+            .unwrap()
+    }
+
+    fn manifest(live: bool) -> Manifest {
+        Manifest {
+            publisher: publisher(),
+            content_id: "show".into(),
+            title: "Show".into(),
+            version: 3,
+            created_at_ms: 1_700_000_000_000,
+            live,
+            segments: vec![],
+        }
     }
 
     #[test]
     fn bundle_id_format() {
-        let id = BundleId::new("my_show", 42);
-        assert_eq!(id.as_str(), "my_show/00042");
-    }
-
-    #[test]
-    fn bundle_verify_passes_on_correct_payload() {
-        let b = make_bundle(Priority::Vod);
-        assert!(b.verify());
-    }
-
-    #[test]
-    fn bundle_verify_fails_on_tampered_payload() {
-        let mut b = make_bundle(Priority::Vod);
-        b.payload = b"tampered".to_vec();
-        assert!(!b.verify());
+        assert_eq!(BundleId::segment(&publisher(), "my_show", 42).as_str(), "0123456789abcdef/my_show/00042");
+        assert_eq!(BundleId::manifest(&publisher(), "my_show").as_str(), "0123456789abcdef/my_show/manifest");
     }
 
     #[test]
     fn bundle_is_valid_for_fresh_bundle() {
         let b = make_bundle(Priority::Vod);
+        assert_eq!(b.age_ms, 0);
         assert!(b.is_valid());
     }
 
     #[test]
-    fn bundle_is_invalid_when_expired() {
-        let mut b = make_bundle(Priority::Vod);
-        b.expires_at = Utc::now() - chrono::Duration::seconds(1);
+    fn bundle_is_invalid_when_age_reaches_lifetime() {
+        let mut b = make_bundle(Priority::Live);
+        b.age_ms = b.lifetime_ms - 1;
+        assert!(b.is_valid());
+        b.age_ms = b.lifetime_ms;
         assert!(!b.is_valid());
+        assert!(!b.meta().is_valid());
     }
 
     #[test]
-    fn live_priority_has_shorter_ttl_than_vod() {
+    fn lifetime_comes_from_priority() {
+        assert_eq!(make_bundle(Priority::Live).lifetime_ms, 1_800_000);
         assert!(Priority::Live.default_ttl_secs() < Priority::Vod.default_ttl_secs());
     }
 
@@ -242,19 +303,23 @@ mod tests {
     fn meta_carries_routing_fields() {
         let b = make_bundle(Priority::Live).with_duration_ms(9_500);
         let m = b.meta();
-        assert_eq!(m.id, "test_content/00000");
+        assert_eq!(m.id, "0123456789abcdef/test_content/00000");
+        assert_eq!(m.publisher, publisher());
         assert_eq!(m.content_id, "test_content");
+        assert_eq!(m.kind, BundleKind::Segment);
         assert_eq!(m.duration_ms, 9_500);
         assert_eq!(m.priority, Priority::Live);
     }
 
     #[test]
-    fn bundle_roundtrips_through_json() {
-        let b = make_bundle(Priority::NearLive);
-        let json = serde_json::to_vec(&b).unwrap();
-        let b2: Bundle = serde_json::from_slice(&json).unwrap();
-        assert_eq!(b.id, b2.id);
-        assert_eq!(b.payload_hash, b2.payload_hash);
-        assert_eq!(b.priority, b2.priority);
+    fn manifest_bundle_carries_signed_bytes() {
+        let b = Bundle::manifest(&publisher(), &manifest(true), b"signed".to_vec(), "node-a");
+        assert_eq!(b.id().as_str(), "0123456789abcdef/show/manifest");
+        assert_eq!(b.info.kind, BundleKind::Manifest);
+        assert_eq!(b.info.priority, Priority::Live);
+        assert_eq!(b.info.created_at_ms, 1_700_000_000_000);
+        assert_eq!(b.payload, b"signed");
+        let vod = Bundle::manifest(&publisher(), &manifest(false), vec![], "node-a");
+        assert_eq!(vod.lifetime_ms, Priority::Vod.lifetime_ms());
     }
 }

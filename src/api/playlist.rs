@@ -26,7 +26,8 @@ pub fn live_playlist(
     delay: Duration,
 ) -> Option<String> {
     let edge = now - chrono::Duration::from_std(delay).ok()?;
-    let last = metas.iter().filter(|m| m.created_at <= edge).map(|m| m.sequence).max()?;
+    let edge_ms = edge.timestamp_millis();
+    let last = metas.iter().filter(|m| m.created_at_ms <= edge_ms).map(|m| m.sequence).max()?;
     let present: BTreeSet<u32> = metas.iter().map(|m| m.sequence).collect();
 
     // Walk back from the edge while the previous sequence is present.
@@ -75,19 +76,23 @@ fn render(content_id: &str, segs: &[&BundleMeta], endlist: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::Priority;
+    use crate::bundle::{BundleKind, Priority};
+    use crate::trust::KeyId;
 
     fn metas(n: u32, now: DateTime<Utc>) -> Vec<BundleMeta> {
         (0..n)
             .map(|i| BundleMeta {
-                id: format!("m/{:05}", i),
+                id: format!("p/m/{:05}", i),
+                publisher: KeyId("p".into()),
                 content_id: "m".into(),
-                content_title: "t".into(),
+                title: "t".into(),
                 sequence: i,
+                kind: BundleKind::Segment,
                 priority: Priority::Live,
-                created_at: now - chrono::Duration::seconds(10 * (n - 1 - i) as i64),
-                expires_at: now + chrono::Duration::hours(1),
+                created_at_ms: (now - chrono::Duration::seconds(10 * (n - 1 - i) as i64)).timestamp_millis(),
                 duration_ms: 10_000,
+                lifetime_ms: Priority::Live.lifetime_ms(),
+                age_ms: 0,
             })
             .collect()
     }

@@ -208,6 +208,15 @@ segment are checked against a signed manifest. The age and the creation time
 are not signed. A carrier can change them, which moves when a bundle expires
 or where the live edge sits, but not the video itself.
 
+A node refuses a manifest only when it holds a newer one. Once its manifest
+expires it accepts an older signed version again, so a peer can replay an old
+version of the content for a while.
+
+A new live manifest is the publisher's whole window. When one is stored, the
+node drops the segments of that stream that it does not list. A publisher
+numbers manifest versions with a counter that outlives expiry, so a restarted
+live stream always gets a higher version than before.
+
 `serve` reads the keys once, at startup. After `keys pair` or `keys unpair`,
 restart a running node. Until the restart it keeps its old trust. So a new
 pairing, and a revocation by `keys unpair`, takes effect after a restart.

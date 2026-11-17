@@ -40,6 +40,8 @@ pub struct BundleStore {
     meta: sled::Tree,
     /// Segment id -> CBOR `HeldSegment`, for segments awaiting a manifest.
     pending: sled::Tree,
+    /// Format marker, expiry clock and manifest version counters.
+    sys: sled::Tree,
     /// Decides expiry together with each bundle's age.
     clock: Arc<dyn MonoClock>,
 }
@@ -48,6 +50,14 @@ pub struct BundleStore {
 /// age-based expiry (sync protocol 2) and holds a different meta layout.
 const FORMAT_KEY: &[u8] = b"format";
 const FORMAT: u8 = 3;
+
+/// Prefix of the `sys` keys that hold the highest manifest version stored
+/// for each `<publisher>/<content_id>`. They outlive the manifests.
+const VERSION_PREFIX: &str = "manifest_version/";
+
+fn version_key(publisher: &KeyId, content_id: &str) -> Vec<u8> {
+    format!("{VERSION_PREFIX}{publisher}/{content_id}").into_bytes()
+}
 
 impl BundleStore {
     pub fn open(path: &str) -> Result<Self> {
@@ -78,9 +88,9 @@ impl BundleStore {
                 sys.insert(FORMAT_KEY, &[FORMAT])?;
             }
         }
-        let clock = make_clock(sys)?;
+        let clock = make_clock(sys.clone())?;
         info!("Bundle store opened at {}", path);
-        Ok(BundleStore { db, meta, pending, clock })
+        Ok(BundleStore { db, meta, pending, sys, clock })
     }
 
     /// Persist the expiry clock. Call on a schedule and at shutdown.
@@ -94,10 +104,10 @@ impl BundleStore {
     /// verified here: this is for the node's own content. Peers use `admit`.
     pub fn insert(&self, bundle: &Bundle) -> Result<bool> {
         if bundle.info.kind == BundleKind::Manifest {
-            let Some(version) = manifest_version_of(bundle) else {
+            let Some(m) = manifest_of(bundle) else {
                 bail!("manifest {} has an unreadable payload", bundle.id());
             };
-            return self.put_manifest(bundle, version);
+            return self.put_manifest(bundle, &m);
         }
         let id = bundle.id();
         let key = id.as_str().as_bytes();
@@ -192,6 +202,16 @@ impl BundleStore {
         };
         let manifest = SignedManifest::from_bytes(&b.payload).and_then(|s| decode::<Manifest>(&s.manifest_cbor));
         Ok(manifest.ok())
+    }
+
+    /// The highest manifest version this store has held for a publisher's
+    /// content, even one that has since expired. 0 when there was none. The
+    /// node's next manifest uses this plus one, so a restarted live stream
+    /// never reuses a version that peers still hold.
+    pub fn last_manifest_version(&self, publisher: &KeyId, content_id: &str) -> Result<u64> {
+        let counter = self.sys.get(version_key(publisher, content_id))?.map_or(0, |v| read_version(&v));
+        let stored = self.manifest(publisher, content_id)?.map_or(0, |m| m.version);
+        Ok(counter.max(stored))
     }
 
     /// Every publisher and content ID in the store with its segment counts.
@@ -338,17 +358,22 @@ fn verify_manifest(b: &Bundle, trust: &dyn KeyLookup) -> Result<Manifest> {
     Ok(m)
 }
 
-/// The version inside a manifest bundle's payload, without checking the
+/// The manifest inside a manifest bundle's payload, without checking the
 /// signature. None when it is unreadable.
-fn manifest_version_of(b: &Bundle) -> Option<u64> {
+fn manifest_of(b: &Bundle) -> Option<Manifest> {
     let signed = SignedManifest::from_bytes(&b.payload).ok()?;
-    decode::<Manifest>(&signed.manifest_cbor).ok().map(|m| m.version)
+    decode::<Manifest>(&signed.manifest_cbor).ok()
 }
 
 /// The version of a manifest already in the store. Stored manifests were
 /// verified on the way in, so this only decodes. None when it is unreadable.
 fn stored_manifest_version(raw: &[u8]) -> Option<u64> {
-    manifest_version_of(&decode_bundle(raw).ok()?)
+    manifest_of(&decode_bundle(raw).ok()?).map(|m| m.version)
+}
+
+/// A version counter value: 8 big-endian bytes, 0 when malformed.
+fn read_version(raw: &[u8]) -> u64 {
+    raw.try_into().map_or(0, u64::from_be_bytes)
 }
 
 /// Check that a bundle's priority fits a verified manifest: live exactly
@@ -432,7 +457,7 @@ impl BundleStore {
         if let Err(reason) = check_priority(b, &m) {
             return Ok(reject(reason));
         }
-        if !self.put_manifest(b, m.version)? {
+        if !self.put_manifest(b, &m)? {
             debug!("Manifest {} version {} is not newer, ignored", b.id(), m.version);
             return Ok(Admission::Duplicate);
         }
@@ -442,33 +467,74 @@ impl BundleStore {
     }
 
     /// Store a manifest bundle unless a valid stored one has the same or a
-    /// higher version.
-    fn put_manifest(&self, b: &Bundle, version: u64) -> Result<bool> {
+    /// higher version. Raises the content's version counter. A stored live
+    /// manifest then drops the segments of its content that it does not list.
+    fn put_manifest(&self, b: &Bundle, m: &Manifest) -> Result<bool> {
         let id = b.id();
         let key = id.as_str().as_bytes();
         let value = encode_bundle(b)?;
         let now = self.clock.now_ms();
         let meta_value = encode(&b.meta(now))?;
+        let counter_key = version_key(&m.publisher, &m.content_id);
         // The version check sits inside the transaction, so two manifests
         // arriving at once can never leave the older one stored.
-        (&*self.db, &self.meta)
-            .transaction(|(db, meta)| -> sled::transaction::ConflictableTransactionResult<bool, ()> {
+        let stored = (&*self.db, &self.meta, &self.sys)
+            .transaction(|(db, meta, sys)| -> sled::transaction::ConflictableTransactionResult<bool, ()> {
                 let live = match meta.get(key)? {
                     Some(raw) => decode::<BundleMeta>(&raw).is_ok_and(|m| m.is_valid(now)),
                     None => false,
                 };
                 if live {
                     if let Some(raw) = db.get(key)? {
-                        if stored_manifest_version(&raw).is_some_and(|v| v >= version) {
+                        if stored_manifest_version(&raw).is_some_and(|v| v >= m.version) {
                             return Ok(false);
                         }
                     }
                 }
                 db.insert(key, value.as_slice())?;
                 meta.insert(key, meta_value.as_slice())?;
+                let counter = sys.get(&counter_key)?.map_or(0, |v| read_version(&v));
+                if m.version > counter {
+                    sys.insert(counter_key.as_slice(), &m.version.to_be_bytes())?;
+                }
                 Ok(true)
             })
-            .map_err(|e| anyhow::anyhow!("manifest insert transaction: {e:?}"))
+            .map_err(|e| anyhow::anyhow!("manifest insert transaction: {e:?}"))?;
+        if stored && m.live {
+            self.drop_unlisted(m)?;
+        }
+        Ok(stored)
+    }
+
+    /// Remove the stored and held segments of a manifest's content that it
+    /// does not list. A newer live manifest is the publisher's whole window,
+    /// so anything outside it is from an old run of the stream.
+    fn drop_unlisted(&self, m: &Manifest) -> Result<()> {
+        let listed: HashSet<u32> = m.segments.iter().map(|s| s.sequence).collect();
+        let prefix = format!("{}/{}/", m.publisher, m.content_id);
+        let mut dropped = 0usize;
+        for item in self.meta.scan_prefix(prefix.as_bytes()) {
+            let (key, value) = item?;
+            let stale = decode::<BundleMeta>(&value)
+                .is_ok_and(|s| s.kind == BundleKind::Segment && !listed.contains(&s.sequence));
+            if stale {
+                self.db.remove(&key)?;
+                self.meta.remove(&key)?;
+                dropped += 1;
+            }
+        }
+        for item in self.pending.scan_prefix(prefix.as_bytes()) {
+            let (key, _) = item?;
+            let listed_seq = std::str::from_utf8(&key[prefix.len()..]).ok().and_then(|s| s.parse::<u32>().ok());
+            if !listed_seq.is_some_and(|seq| listed.contains(&seq)) {
+                self.pending.remove(&key)?;
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            info!("Live manifest {}/{} version {}: dropped {} unlisted segments", m.publisher, m.content_id, m.version, dropped);
+        }
+        Ok(())
     }
 
     fn admit_segment(&self, b: &Bundle, trust: &dyn KeyLookup) -> Result<Admission> {
@@ -1225,6 +1291,54 @@ mod tests {
             assert_eq!(store.admit(&manifest_bundle(&key, &manifest(&key, 1, 0..2)), &keys).unwrap(), Admission::Stored);
             assert_eq!(store.get(retitled.id().as_str()).unwrap().unwrap().info.title, "Show");
             assert!(!is_stored(&store, &wrong_duration));
+        }
+
+        #[test]
+        fn newer_live_manifest_drops_unlisted_segments() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            assert_eq!(store.admit(&manifest_bundle(&key, &live_manifest(&key, 1, 0..3)), &keys).unwrap(), Admission::Stored);
+            for s in 0..3 {
+                assert_eq!(store.admit(&segment_with(&key, s, Priority::Live), &keys).unwrap(), Admission::Stored);
+            }
+            // Version 2 lists 2 and 3 only, for example after the publisher restarted.
+            assert_eq!(store.admit(&manifest_bundle(&key, &live_manifest(&key, 2, 2..4)), &keys).unwrap(), Admission::Stored);
+            let seqs: Vec<u32> = store.list_meta(&key.key_id(), "show").unwrap().iter().map(|m| m.sequence).collect();
+            assert_eq!(seqs, vec![2]);
+            assert_eq!(store.db.len(), store.meta.len(), "payloads removed with their meta");
+
+            // The node's own live manifest prunes the same way.
+            assert!(store.insert(&manifest_bundle(&key, &live_manifest(&key, 3, 3..4))).unwrap());
+            assert!(store.list_meta(&key.key_id(), "show").unwrap().is_empty());
+        }
+
+        #[test]
+        fn newer_vod_manifest_keeps_stored_segments() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            assert_eq!(store.admit(&manifest_bundle(&key, &manifest(&key, 1, 0..2)), &keys).unwrap(), Admission::Stored);
+            assert_eq!(store.admit(&segment(&key, 0, payload(0)), &keys).unwrap(), Admission::Stored);
+            assert_eq!(store.admit(&manifest_bundle(&key, &manifest(&key, 2, 1..2)), &keys).unwrap(), Admission::Stored);
+            assert_eq!(store.list_meta(&key.key_id(), "show").unwrap().len(), 1);
+        }
+
+        #[test]
+        fn manifest_version_counter_outlives_the_manifest() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            assert_eq!(store.last_manifest_version(&key.key_id(), "show").unwrap(), 0);
+            assert!(store.insert(&manifest_bundle(&key, &live_manifest(&key, 5, 0..1))).unwrap());
+            assert_eq!(store.last_manifest_version(&key.key_id(), "show").unwrap(), 5);
+            store.clock.advance(Priority::Live.lifetime_ms());
+            assert!(store.manifest(&key.key_id(), "show").unwrap().is_none(), "manifest expired");
+            assert_eq!(store.last_manifest_version(&key.key_id(), "show").unwrap(), 5);
+            assert_eq!(store.last_manifest_version(&key.key_id(), "other").unwrap(), 0);
+            // A version admitted from a peer counts too.
+            let keys = Keys(vec![key.clone()]);
+            assert_eq!(store.admit(&manifest_bundle(&key, &live_manifest(&key, 9, 0..1)), &keys).unwrap(), Admission::Stored);
+            assert_eq!(store.last_manifest_version(&key.key_id(), "show").unwrap(), 9);
         }
 
         #[test]

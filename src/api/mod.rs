@@ -431,7 +431,9 @@ fn publish_manifest(state: &ApiState, key: &PublisherKey, content_id: &str, mode
         publisher: publisher.clone(),
         content_id: content_id.to_string(),
         title: metas.last().map(|m| m.title.clone()).unwrap_or_default(),
-        version: previous.map_or(1, |p| p.version + 1),
+        // The counter outlives an expired manifest, so a restarted live
+        // stream never reuses a version that peers still hold.
+        version: state.store.last_manifest_version(&publisher, content_id)? + 1,
         created_at_ms: chrono::Utc::now().timestamp_millis(),
         live,
         segments,
@@ -469,6 +471,19 @@ mod tests {
     fn test_state_with_key(key: Option<PublisherKey>) -> (ApiState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(BundleStore::open(dir.path().to_str().unwrap()).unwrap());
+        state_on(store, dir, key)
+    }
+
+    /// Like `test_state_with_key`, on a store clock the test moves by hand.
+    fn fake_clock_state(key: PublisherKey) -> (ApiState, Arc<crate::store::FakeMono>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(crate::store::FakeMono::default());
+        let store = Arc::new(BundleStore::open_with_clock(dir.path().to_str().unwrap(), clock.clone()).unwrap());
+        let (state, dir) = state_on(store, dir, Some(key));
+        (state, clock, dir)
+    }
+
+    fn state_on(store: Arc<BundleStore>, dir: tempfile::TempDir, key: Option<PublisherKey>) -> (ApiState, tempfile::TempDir) {
         let delay = Duration::from_secs(120);
         let trust = Arc::new(Trust::new(key.clone(), PairedKeys::open(dir.path()).unwrap()));
         let router = Arc::new(EpidemicRouter::new(store.clone(), "t".into(), 0, delay, trust));
@@ -789,6 +804,26 @@ mod tests {
             assert_eq!(last.sequence, seq);
             assert_eq!(last.hash, *blake3::hash(&seg_payload(seq)).as_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn restarted_live_stream_gets_a_higher_manifest_version() {
+        let key = PublisherKey::generate();
+        let (state, clock, _dir) = fake_clock_state(key.clone());
+        let store = state.store.clone();
+        let app = local_app(state);
+        for seq in 0..3 {
+            let res = send(&app, post_json("/ingest", &ingest_body("demo", seq, "live", &seg_payload(seq)))).await;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        assert_eq!(stored_manifest(&store, &key, "demo").unwrap().version, 3);
+
+        // The stream stops and its manifest expires. Peers that were off keep version 3.
+        clock.advance(Priority::Live.lifetime_ms());
+        assert!(stored_manifest(&store, &key, "demo").is_none());
+        let res = send(&app, post_json("/ingest", &ingest_body("demo", 0, "live", &seg_payload(0)))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(stored_manifest(&store, &key, "demo").unwrap().version, 4);
     }
 
     #[tokio::test]

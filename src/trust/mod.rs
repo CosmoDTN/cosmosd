@@ -5,6 +5,8 @@
 //! 32 raw private bytes (mode 0600) and `paired.keys` holds one pairing string
 //! per line. A key ID is the first 8 bytes of BLAKE3 of the public key, in hex.
 
+pub mod manifest;
+
 use std::fmt;
 use std::fs;
 use std::io::Write;

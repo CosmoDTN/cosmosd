@@ -88,7 +88,7 @@ impl BundleStore {
     }
 
     /// Insert a bundle. Returns false if a valid copy is already present
-    /// (dedup by BundleId); an expired copy is overwritten. A manifest
+    /// (dedup by BundleId). An expired copy is overwritten. A manifest
     /// replaces the stored one only when its version is higher. Nothing is
     /// verified here: this is for the node's own content. Peers use `admit`.
     pub fn insert(&self, bundle: &Bundle) -> Result<bool> {

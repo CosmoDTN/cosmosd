@@ -12,11 +12,11 @@ Designed for networks where internet connectivity is absent, intermittent, or ex
 
 ## How it works
 
-Content is chunked into 10-second HLS segments by [`cosmoscast-ingest`](https://github.com/CosmoDTN/cosmocast-ingest). Each segment is wrapped in a **bundle** — a self-describing unit with a content ID, sequence number, priority, TTL, and a BLAKE3 integrity hash.
+Content is chunked into 10-second HLS segments by `cosmosd ingest`. Each segment is wrapped in a **bundle**. A bundle names its publisher, content ID, sequence number and priority. It also carries a lifetime and an age. The node that ingests signs a manifest that lists each segment's BLAKE3 hash. Other nodes accept only content from publishers they have paired. See [Pairing and signed content](#pairing-and-signed-content).
 
 `cosmosd` uses **epidemic routing**: when two nodes connect, they exchange bundle manifests and transfer what the other is missing. Bundles propagate through the network hop-by-hop until they reach every reachable node.
 
-Viewers watch via any HLS player pointed at `http://localhost:7777/play/{content_id}`. Playback is **time-shifted, not buffered** — cosmosd pre-positions chunks ahead of the playhead so there is no spinner.
+Viewers watch via any HLS player pointed at `http://localhost:7777/play/{content_id}`, or `/play/{publisher}/{content_id}` when two publishers use the same content ID. Playback is **time-shifted, not buffered**. cosmosd pre-positions chunks ahead of the playhead so there is no spinner.
 
 ```
 [Ingest node]          [Relay node]          [Viewer node]
@@ -109,10 +109,14 @@ cargo build --release
 ## Usage
 
 ```bash
+# Create this node's publisher key (once, before the first ingest)
+cosmosd keys init
+
 # Start the daemon (defaults: HTTP on 7777, relay on 7778)
 cosmosd serve
 
 # Ingest a local video file (requires ffmpeg + daemon running)
+# Ingest signs under the node's key, then publishes the signed manifest.
 cosmosd ingest /path/to/movie.mkv
 cosmosd ingest /path/to/movie.mkv --title "Interstellar"
 cosmosd ingest /path/to/movie.mkv --daemon http://127.0.0.1:8888  # a daemon on another port
@@ -155,6 +159,52 @@ All options:
 | `--bind` | `127.0.0.1` | HTTP API bind address (`0.0.0.0` to expose on all interfaces) |
 | `--delay` | `120` | Seconds the viewer plays behind live; also the window of newest segments a gateway pulls first. Use the same value on the gateway and cabin nodes |
 | `--sync-interval` | `5` | Seconds between syncs with a healthy peer |
+| `--key-dir` | `$HOME/.config/cosmosd` | Publisher key and paired keys. Bundles from peers are accepted only from this node's key and the keys paired here |
+
+---
+
+## Pairing and signed content
+
+Every piece of content has a publisher. A publisher is a node with an Ed25519
+key. Create the key on the node that ingests:
+
+```bash
+cosmosd keys init    # create this node's publisher key
+cosmosd keys show    # print its pairing string and key ID
+```
+
+`keys show` prints a pairing string that starts with `cosmos-key:`. Copy it to
+every node that should accept this publisher's content and pair it there:
+
+```bash
+cosmosd keys pair cosmos-key:...
+cosmosd keys list              # the paired key IDs
+cosmosd keys unpair <key id>   # stop trusting a publisher
+```
+
+Keys live in `$HOME/.config/cosmosd`. Pass `--key-dir` to `keys` and `serve`
+to use another directory. The key file is the node's identity. Do not copy it
+to other machines and do not commit it.
+
+Ingest signs content under the node's key. For each content item the node
+publishes a signed manifest. The manifest lists every segment with its BLAKE3
+hash. A live stream gets a new manifest version after each segment, listing
+the last 180 segments. A file gets its manifest when `cosmosd ingest` finishes.
+Without a key, `POST /ingest` answers 409 with `run cosmosd keys init first`.
+
+A node stores a bundle from a peer only when it checks out:
+
+- The publisher is the node's own key or a paired key.
+- A manifest carries a valid signature. It replaces the stored one only when
+  its version is higher.
+- A segment matches the hash its manifest lists. A segment that arrives before
+  its manifest waits up to 10 minutes for it.
+
+Everything else is dropped. A node never passes on content it could not check.
+
+`serve` reads the keys once, at startup. After `keys pair` or `keys unpair`,
+restart a running node. Until the restart it keeps its old trust. So a new
+pairing, and a revocation by `keys unpair`, takes effect after a restart.
 
 ---
 
@@ -169,6 +219,7 @@ There are three roles:
   relay port and a token:
 
   ```bash
+  cosmosd keys init      # once, then pair its key on the other nodes
   cosmosd serve --relay-port 443 --relay-token "$SECRET" --no-discovery
   cosmosd ingest --live <stream URL> --content-id match --title "The match"
   ```
@@ -194,6 +245,7 @@ There are three roles:
   without demanding it from the cabin nodes that dial in:
 
   ```bash
+  cosmosd keys pair cosmos-key:...   # the ground node's `keys show` output
   cosmosd serve --peer "ground.example.com:443@$SECRET"
   ```
 
@@ -202,6 +254,7 @@ There are three roles:
   serve the player to phones:
 
   ```bash
+  cosmosd keys pair cosmos-key:...   # the ground node's `keys show` output
   cosmosd serve --bind 0.0.0.0
   # watch: http://<laptop>:7777/play/match in Safari, VLC or ffplay
   ```
@@ -236,6 +289,8 @@ finds the gateway by mDNS. A headless player (`examples/playcheck.rs`) watches
 the cabin while the script cuts the link for 30 seconds, then for 5 minutes.
 It checks that the short cut causes no stall, the long one does, and playback
 ends about 2 minutes behind live, then prints `DEMO PASS` or `DEMO FAIL: <why>`.
+The ground node gets a fresh key and the other two pair it. All three key dirs
+are temp dirs, so the run never touches your own keys.
 Watch along with `ffplay http://127.0.0.1:37777/play/demo`; logs are kept in the
 temp directory it prints. If mDNS can't work on your machine,
 `DEMO_CABIN_PEER=1` gives the cabin an explicit `--peer` to the gateway instead.
@@ -245,19 +300,27 @@ temp directory it prints. If mDNS can't work on your machine,
 ## HTTP API
 
 The API binds to `127.0.0.1` by default. `--bind 0.0.0.0` exposes the read
-routes (`GET`) to the network, so phones can play; the write routes
-(`POST /ingest`, `POST /peers`) answer only to localhost, whatever `--bind`
-says, and return 403 to anyone else.
+routes (`GET`) to the network, so phones can play. The write routes
+(`POST /ingest`, `POST /ingest/finish`, `POST /peers`) answer only to
+localhost, whatever `--bind` says. They return 403 to anyone else.
+
+The short forms `/play/:content_id` and `/segment/:content_id/:sequence` work
+while exactly one publisher has that content ID. When several do, they answer
+300 with a JSON list of the publisher IDs. Playlists always list the full
+`/segment/:publisher/...` form.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/` | Phone player page: lists titles and plays them (hls.js built in, no internet needed) |
 | `GET` | `/hls.min.js` | The embedded hls.js used by the player page |
-| `GET` | `/health` | Node status, version |
-| `GET` | `/catalog` | List all stored content |
-| `GET` | `/play/:content_id` | HLS M3U8 playlist |
-| `GET` | `/segment/:content_id/:sequence` | Raw `.ts` segment bytes |
-| `POST` | `/ingest` | Add a bundle (used by `cosmosd ingest`; localhost only) |
+| `GET` | `/health` | Node status, version, publisher key ID (null without a key) |
+| `GET` | `/catalog` | All stored content, one entry per publisher and content ID |
+| `GET` | `/play/:publisher/:content_id` | HLS M3U8 playlist |
+| `GET` | `/play/:content_id` | Same, when one publisher has this content ID |
+| `GET` | `/segment/:publisher/:content_id/:sequence` | Raw `.ts` segment bytes |
+| `GET` | `/segment/:content_id/:sequence` | Same, when one publisher has this content ID |
+| `POST` | `/ingest` | Add a segment, signed under the node's key. A `live` segment also publishes the next manifest version (localhost only) |
+| `POST` | `/ingest/finish` | Publish the signed manifest of a finished item, body `{"content_id": "..."}` (localhost only) |
 | `GET` | `/peers` | Connected peers and sync status |
 | `POST` | `/peers` | Add a peer at runtime (localhost only) |
 
@@ -277,6 +340,11 @@ curl -s -X POST http://localhost:7777/ingest \
     \"duration_ms\": 10000,
     \"payload_b64\": \"$PAYLOAD_B64\"
   }"
+
+# After the last segment of a non-live item, publish its manifest
+curl -s -X POST http://localhost:7777/ingest/finish \
+  -H "Content-Type: application/json" \
+  -d '{"content_id": "my_show_ep1"}'
 ```
 
 ### Example: play content
@@ -301,7 +369,14 @@ ffplay http://localhost:7777/play/my_show_ep1
 | `near_live` | 6 hours | Best-effort |
 | `vod` | 30 days | Carry indefinitely |
 
-Expired bundles are reaped automatically every 5 minutes.
+A bundle expires by age, not by wall clock. Its lifetime comes from its
+priority. Its age counts how long it has existed. Each node adds the time it
+held the bundle before passing it on. The bundle expires when its age reaches
+its lifetime. A node with a wrong clock still expires bundles on time.
+
+Each node measures held time on a clock that only moves forward. It saves that
+clock every 5 minutes and on a clean stop. Time while a node is off is not
+counted. Expired bundles are reaped automatically every 5 minutes.
 
 ---
 
@@ -311,8 +386,10 @@ Expired bundles are reaped automatically every 5 minutes.
 cosmosd
 ├── src/
 │   ├── main.rs          — CLI, startup, background task wiring
-│   ├── bundle/          — BPv7-inspired bundle format, BLAKE3 integrity
-│   ├── store/           — Content-addressed bundle store (sled)
+│   ├── bundle/          — Bundle and content info, keyed by publisher
+│   ├── wire/            — RFC 9171 encoding of bundles
+│   ├── trust/           — Publisher keys, pairing and signed manifests
+│   ├── store/           — Bundle store (sled), age-based expiry, admission checks
 │   ├── router/          — Epidemic routing logic
 │   ├── peer/            — Peer manager: outgoing sync + relay listener
 │   ├── transport/       — Convergence layer trait + TCP implementation
@@ -338,7 +415,7 @@ Community transports:
 
 ## Protocol
 
-The bundle format is a working subset of [IETF BPv7 (RFC 9171)](https://www.rfc-editor.org/rfc/rfc9171) extended with streaming-specific fields (sequence number, priority, HLS MIME type). Full BPv7 wire compatibility is a future goal.
+Bundles travel as standard [IETF BPv7 (RFC 9171)](https://www.rfc-editor.org/rfc/rfc9171) bundles. The streaming fields (publisher, content ID, sequence number, priority, MIME type) ride in a private-use block, type 192. The age block carries the bundle's age.
 
 ---
 

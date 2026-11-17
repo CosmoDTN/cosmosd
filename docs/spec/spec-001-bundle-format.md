@@ -112,3 +112,7 @@ A decoder refuses a bundle, with an error and never a panic, when:
 - the source is `dtn:none`.
 
 A missing hop count block reads as count 0.
+
+## Interop
+
+A stock BPv7 node, µD3TN, stores and forwards these bundles with block 192 intact. See `interop.md`.

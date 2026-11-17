@@ -13,6 +13,7 @@
 //!   cosmosd keys init                                # Create a publisher key
 //!   cosmosd keys show                                # Print pairing string and key ID
 //!   cosmosd keys pair cosmos-key:...                 # Trust a publisher
+//!   cosmosd dev-bundle --out sample.bundle           # Hidden: one sample bundle for interop tests
 
 mod api;
 mod auth;
@@ -155,6 +156,20 @@ enum Command {
         #[command(subcommand)]
         action: KeysCmd,
     },
+
+    /// Write one sample RFC 9171 segment bundle (--out), or decode a bundle
+    /// file and print its fields (--check). For interop tests with other
+    /// BPv7 nodes, see scripts/interop-ud3tn.sh.
+    #[command(hide = true)]
+    DevBundle {
+        /// File to write the sample bundle to.
+        #[arg(long, required_unless_present = "check", conflicts_with = "check")]
+        out: Option<PathBuf>,
+
+        /// Bundle file to decode with wire::decode_bundle.
+        #[arg(long)]
+        check: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -201,6 +216,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Keys { key_dir, action } => keys_command(key_dir, action)?,
+        Command::DevBundle { out, check } => dev_bundle_command(out, check)?,
     }
 
     Ok(())
@@ -248,6 +264,69 @@ fn keys_command(key_dir: Option<PathBuf>, action: KeysCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// === Dev bundle ===
+
+/// Content ID, payload and source node of the sample bundle.
+const DEV_CONTENT_ID: &str = "interop-sample";
+const DEV_PAYLOAD: &[u8] = b"cosmosd interop sample segment\n";
+const DEV_SOURCE_NODE: &str = "cosmosd-dev";
+
+fn dev_bundle_command(out: Option<PathBuf>, check: Option<PathBuf>) -> Result<()> {
+    match (out, check) {
+        (Some(out), None) => {
+            std::fs::write(&out, dev_bundle_bytes()?).with_context(|| format!("writing {}", out.display()))?;
+            println!("wrote {}", out.display());
+        }
+        (None, Some(check)) => {
+            let bytes = std::fs::read(&check).with_context(|| format!("reading {}", check.display()))?;
+            print!("{}", describe_bundle(&bytes)?);
+        }
+        _ => unreachable!("clap requires exactly one of --out and --check"),
+    }
+    Ok(())
+}
+
+/// One segment bundle as RFC 9171 bytes. The publisher is a throwaway key
+/// that is never saved, so nothing will admit the segment. It is for
+/// carrying only.
+fn dev_bundle_bytes() -> Result<Vec<u8>> {
+    let publisher = trust::PublisherKey::generate().key_id();
+    let b = bundle::Bundle::segment(
+        &publisher,
+        DEV_CONTENT_ID,
+        "Interop sample",
+        0,
+        "video/mp2t",
+        bundle::Priority::Live,
+        DEV_PAYLOAD.to_vec(),
+        DEV_SOURCE_NODE,
+    )?;
+    wire::encode_bundle(&b)
+}
+
+/// Decode with `wire::decode_bundle` and list the fields, one `key=value`
+/// per line. The first five lines are the identity a carrier must not change.
+fn describe_bundle(bytes: &[u8]) -> Result<String> {
+    let b = wire::decode_bundle(bytes)?;
+    let kind = match b.info.kind {
+        bundle::BundleKind::Segment => "segment",
+        bundle::BundleKind::Manifest => "manifest",
+    };
+    Ok(format!(
+        "publisher={}\ncontent_id={}\nkind={kind}\nsequence={}\npayload_blake3={}\n\
+         payload_len={}\nsource_node={}\nage_ms={}\nhop_count={}\nprevious_node={}\n",
+        b.publisher,
+        b.info.content_id,
+        b.info.sequence,
+        blake3::hash(&b.payload).to_hex(),
+        b.payload.len(),
+        b.source_node,
+        b.age_ms,
+        b.hop_count,
+        b.previous_node.as_deref().unwrap_or("none"),
+    ))
 }
 
 async fn serve(
@@ -421,5 +500,56 @@ mod tests {
             assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", token]).is_err(), "{token:?}");
         }
         assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", "s3cret"]).is_ok());
+    }
+
+    #[test]
+    fn dev_bundle_needs_out_or_check() {
+        assert!(Cli::try_parse_from(["cosmosd", "dev-bundle"]).is_err());
+        assert!(Cli::try_parse_from(["cosmosd", "dev-bundle", "--out", "a", "--check", "b"]).is_err());
+        assert!(Cli::try_parse_from(["cosmosd", "dev-bundle", "--out", "a"]).is_ok());
+        assert!(Cli::try_parse_from(["cosmosd", "dev-bundle", "--check", "b"]).is_ok());
+    }
+
+    #[test]
+    fn dev_bundle_writes_a_bundle_both_decoders_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sample.bundle");
+        dev_bundle_command(Some(out.clone()), None).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+
+        let ours = wire::decode_bundle(&bytes).expect("wire::decode_bundle accepts the sample");
+        assert_eq!(ours.info.kind, bundle::BundleKind::Segment);
+        assert_eq!(ours.info.content_id, DEV_CONTENT_ID);
+        assert_eq!(ours.payload, DEV_PAYLOAD);
+        assert_eq!(ours.source_node, DEV_SOURCE_NODE);
+
+        let stock = bp7::bundle::Bundle::try_from(bytes.as_slice()).expect("stock bp7 decodes the sample");
+        stock.validate().expect("stock bp7 validates the sample");
+        assert!(stock.extension_block_by_type(wire::CONTENT_BLOCK_TYPE).is_some());
+        assert_eq!(stock.payload().unwrap(), &DEV_PAYLOAD.to_vec());
+    }
+
+    #[test]
+    fn dev_bundle_uses_a_new_key_each_time() {
+        let a = wire::decode_bundle(&dev_bundle_bytes().unwrap()).unwrap();
+        let b = wire::decode_bundle(&dev_bundle_bytes().unwrap()).unwrap();
+        assert_ne!(a.publisher, b.publisher);
+    }
+
+    #[test]
+    fn describe_bundle_lists_identity_first() {
+        let bytes = dev_bundle_bytes().unwrap();
+        let b = wire::decode_bundle(&bytes).unwrap();
+        let text = describe_bundle(&bytes).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], format!("publisher={}", b.publisher));
+        assert_eq!(lines[1], format!("content_id={DEV_CONTENT_ID}"));
+        assert_eq!(lines[2], "kind=segment");
+        assert_eq!(lines[3], "sequence=0");
+        assert_eq!(lines[4], format!("payload_blake3={}", blake3::hash(DEV_PAYLOAD).to_hex()));
+        assert!(text.contains("age_ms=0\n"));
+        assert!(text.contains("hop_count=0\n"));
+        assert!(text.contains("previous_node=none\n"));
+        assert!(describe_bundle(b"not a bundle").is_err());
     }
 }

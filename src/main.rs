@@ -366,6 +366,9 @@ async fn serve(
     let peers = initial_peers.iter().map(|a| auth::parse_peer(a)).collect::<Result<Vec<_>>>()?;
     let store = Arc::new(BundleStore::open(&store_path)?);
     let (own_key, trust) = load_trust(&key_dir)?;
+    // A publisher unpaired since the last run loses its content here.
+    let purged = store.purge_untrusted(&*trust)?;
+    info!("Untrusted:     removed {} bundles", purged);
 
     // 1. Relay auth
     let relay_auth = Arc::new(RelayAuth::new(relay_token));

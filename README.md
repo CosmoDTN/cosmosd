@@ -220,6 +220,8 @@ live stream always gets a higher version than before.
 `serve` reads the keys once, at startup. After `keys pair` or `keys unpair`,
 restart a running node. Until the restart it keeps its old trust. So a new
 pairing, and a revocation by `keys unpair`, takes effect after a restart.
+At startup a node deletes the stored content of every publisher it no longer
+trusts, so it stops offering it to peers.
 
 ---
 

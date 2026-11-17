@@ -275,6 +275,32 @@ impl BundleStore {
         Ok(out)
     }
 
+    /// Remove stored and held bundles whose publisher `trust` does not know.
+    /// Run at startup, so a revoked publisher's content is neither kept nor
+    /// offered. Returns how many were removed.
+    pub fn purge_untrusted(&self, trust: &dyn KeyLookup) -> Result<usize> {
+        let trusted = |publisher: &str| trust.lookup(&KeyId(publisher.to_string())).is_some();
+        let mut removed = 0usize;
+        for item in self.meta.iter() {
+            let (key, value) = item?;
+            let m: BundleMeta = decode(&value)?;
+            if !trusted(&m.publisher.0) {
+                self.db.remove(&key)?;
+                self.meta.remove(&key)?;
+                removed += 1;
+            }
+        }
+        for item in self.pending.iter() {
+            let (key, _) = item?;
+            let id = String::from_utf8_lossy(&key);
+            if !trusted(id.split('/').next().unwrap_or_default()) {
+                self.pending.remove(&key)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Remove expired bundles. Call periodically from background task.
     pub fn reap_expired(&self) -> Result<usize> {
         let now = self.clock.now_ms();
@@ -1339,6 +1365,28 @@ mod tests {
             let keys = Keys(vec![key.clone()]);
             assert_eq!(store.admit(&manifest_bundle(&key, &live_manifest(&key, 9, 0..1)), &keys).unwrap(), Admission::Stored);
             assert_eq!(store.last_manifest_version(&key.key_id(), "show").unwrap(), 9);
+        }
+
+        #[test]
+        fn purge_removes_bundles_of_publishers_no_longer_trusted() {
+            let store = temp_store();
+            let (kept, revoked) = (PublisherKey::generate(), PublisherKey::generate());
+            let both = Keys(vec![kept.clone(), revoked.clone()]);
+            for key in [&kept, &revoked] {
+                assert!(store.insert(&manifest_bundle(key, &manifest(key, 1, 0..1))).unwrap());
+                assert!(store.insert(&segment(key, 0, payload(0))).unwrap());
+                // Segment 5 of another content waits for its manifest.
+                let held = Bundle::segment(&key.key_id(), "later", "L", 5, "video/mp2t", Priority::Vod, payload(5), "n");
+                assert_eq!(store.admit(&held.unwrap(), &both).unwrap(), Admission::Held);
+            }
+            let only_kept = Keys(vec![kept.clone()]);
+            assert_eq!(store.purge_untrusted(&only_kept).unwrap(), 3);
+            assert!(store.all_meta().unwrap().iter().all(|m| m.publisher == kept.key_id()));
+            assert_eq!(store.all_meta().unwrap().len(), 2);
+            assert_eq!(store.db.len(), 2);
+            let held: Vec<String> = store.held_ids().unwrap().into_iter().collect();
+            assert_eq!(held, vec![format!("{}/later/00005", kept.key_id())]);
+            assert_eq!(store.purge_untrusted(&only_kept).unwrap(), 0);
         }
 
         #[test]

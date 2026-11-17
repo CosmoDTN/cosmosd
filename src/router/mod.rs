@@ -198,7 +198,7 @@ impl EpidemicRouter {
                     continue;
                 }
             };
-            if bundle.is_valid() {
+            if bundle.valid_on_arrival() {
                 self.store.insert(&bundle)?;
                 received += 1;
             }

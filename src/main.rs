@@ -292,7 +292,9 @@ async fn serve(
     )
     .with_incoming_registration(!no_discovery));
 
-    // 4. Background: reap expired bundles every 5 minutes
+    // 4. Background: reap expired bundles and flush the expiry clock every
+    //    5 minutes. There is no clean shutdown path yet, so the flush here
+    //    bounds the time lost on exit.
     {
         let store = store.clone();
         tokio::spawn(async move {
@@ -300,6 +302,9 @@ async fn serve(
             loop {
                 interval.tick().await;
                 let _ = store.reap_expired();
+                if let Err(e) = store.flush_clock() {
+                    tracing::warn!("Failed to flush the store clock: {}", e);
+                }
             }
         });
     }

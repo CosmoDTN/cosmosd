@@ -92,7 +92,8 @@ mod tests {
                 created_at_ms: (now - chrono::Duration::seconds(10 * (n - 1 - i) as i64)).timestamp_millis(),
                 duration_ms: 10_000,
                 lifetime_ms: Priority::Live.lifetime_ms(),
-                age_ms: 0,
+                age_at_insert_ms: 0,
+                inserted_mono_ms: 0,
             })
             .collect()
     }

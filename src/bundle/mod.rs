@@ -197,8 +197,9 @@ impl Bundle {
         }
     }
 
-    /// Routing fields without the payload.
-    pub fn meta(&self) -> BundleMeta {
+    /// Routing fields without the payload. `inserted_mono_ms` is the store
+    /// clock reading at the moment the bundle is stored.
+    pub fn meta(&self, inserted_mono_ms: u64) -> BundleMeta {
         BundleMeta {
             id: self.id().0,
             publisher: self.publisher.clone(),
@@ -210,12 +211,15 @@ impl Bundle {
             created_at_ms: self.info.created_at_ms,
             duration_ms: self.info.duration_ms,
             lifetime_ms: self.lifetime_ms,
-            age_ms: self.age_ms,
+            age_at_insert_ms: self.age_ms,
+            inserted_mono_ms,
         }
     }
 
-    /// True while the bundle's age is below its lifetime.
-    pub fn is_valid(&self) -> bool {
+    /// True while the age the bundle arrived with is below its lifetime.
+    /// This is the age at receipt only. It ignores time held in a store, so
+    /// use `BundleMeta::is_valid` for anything already stored.
+    pub fn valid_on_arrival(&self) -> bool {
         self.age_ms < self.lifetime_ms
     }
 }
@@ -235,13 +239,21 @@ pub struct BundleMeta {
     pub created_at_ms: i64,
     pub duration_ms: u32,
     pub lifetime_ms: u64,
-    pub age_ms: u64,
+    /// Age the bundle had when this node stored it.
+    pub age_at_insert_ms: u64,
+    /// Store clock reading when this node stored it.
+    pub inserted_mono_ms: u64,
 }
 
 impl BundleMeta {
+    /// Age now: the age at insert plus the time this node has held it.
+    pub fn age_ms(&self, now_mono_ms: u64) -> u64 {
+        self.age_at_insert_ms.saturating_add(now_mono_ms.saturating_sub(self.inserted_mono_ms))
+    }
+
     /// True while the bundle's age is below its lifetime.
-    pub fn is_valid(&self) -> bool {
-        self.age_ms < self.lifetime_ms
+    pub fn is_valid(&self, now_mono_ms: u64) -> bool {
+        self.age_ms(now_mono_ms) < self.lifetime_ms
     }
 }
 
@@ -280,17 +292,16 @@ mod tests {
     fn bundle_is_valid_for_fresh_bundle() {
         let b = make_bundle(Priority::Vod);
         assert_eq!(b.age_ms, 0);
-        assert!(b.is_valid());
+        assert!(b.valid_on_arrival());
     }
 
     #[test]
     fn bundle_is_invalid_when_age_reaches_lifetime() {
         let mut b = make_bundle(Priority::Live);
         b.age_ms = b.lifetime_ms - 1;
-        assert!(b.is_valid());
+        assert!(b.valid_on_arrival());
         b.age_ms = b.lifetime_ms;
-        assert!(!b.is_valid());
-        assert!(!b.meta().is_valid());
+        assert!(!b.valid_on_arrival());
     }
 
     #[test]
@@ -302,7 +313,7 @@ mod tests {
     #[test]
     fn meta_carries_routing_fields() {
         let b = make_bundle(Priority::Live).with_duration_ms(9_500);
-        let m = b.meta();
+        let m = b.meta(0);
         assert_eq!(m.id, "0123456789abcdef/test_content/00000");
         assert_eq!(m.publisher, publisher());
         assert_eq!(m.content_id, "test_content");

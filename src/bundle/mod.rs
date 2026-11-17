@@ -7,7 +7,10 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::trust::{manifest::Manifest, KeyId};
+use crate::trust::{
+    manifest::{Manifest, SignedManifest},
+    KeyId,
+};
 
 /// Default HLS segment duration in milliseconds.
 pub const DEFAULT_SEGMENT_MS: u32 = 10_000;
@@ -95,6 +98,11 @@ impl BundleId {
 
     pub fn manifest(publisher: &KeyId, content_id: &str) -> Self {
         BundleId(format!("{}/{}/manifest", publisher, content_id))
+    }
+
+    /// True for a manifest id. Segment ids end in a number, so the suffix is enough.
+    pub fn is_manifest_id(id: &str) -> bool {
+        id.ends_with("/manifest")
     }
 
     pub fn as_str(&self) -> &str {
@@ -213,6 +221,10 @@ impl Bundle {
             lifetime_ms: self.lifetime_ms,
             age_at_insert_ms: self.age_ms,
             inserted_mono_ms,
+            version: match self.info.kind {
+                BundleKind::Segment => 0,
+                BundleKind::Manifest => manifest_version(&self.payload),
+            },
         }
     }
 
@@ -222,6 +234,15 @@ impl Bundle {
     pub fn valid_on_arrival(&self) -> bool {
         self.age_ms < self.lifetime_ms
     }
+}
+
+/// The version inside a manifest payload, read without checking the
+/// signature. 0 when the payload is unreadable. Peers use it only to decide
+/// what to pull, and the store verifies whatever arrives.
+fn manifest_version(payload: &[u8]) -> u64 {
+    SignedManifest::from_bytes(payload)
+        .and_then(|s| crate::codec::decode::<Manifest>(&s.manifest_cbor))
+        .map_or(0, |m| m.version)
 }
 
 // === BundleMeta ===
@@ -243,6 +264,9 @@ pub struct BundleMeta {
     pub age_at_insert_ms: u64,
     /// Store clock reading when this node stored it.
     pub inserted_mono_ms: u64,
+    /// Signed manifest version for a manifest, 0 for a segment.
+    #[serde(default)]
+    pub version: u64,
 }
 
 impl BundleMeta {
@@ -320,6 +344,19 @@ mod tests {
         assert_eq!(m.kind, BundleKind::Segment);
         assert_eq!(m.duration_ms, 9_500);
         assert_eq!(m.priority, Priority::Live);
+    }
+
+    #[test]
+    fn meta_carries_manifest_version() {
+        let key = crate::trust::PublisherKey::generate();
+        let mut m = manifest(true);
+        m.publisher = key.key_id();
+        let signed = SignedManifest::sign(&m, &key).unwrap().to_bytes().unwrap();
+        assert_eq!(Bundle::manifest(&key.key_id(), &m, signed, "node-a").meta(0).version, 3);
+        assert_eq!(Bundle::manifest(&key.key_id(), &m, b"junk".to_vec(), "node-a").meta(0).version, 0);
+        assert_eq!(make_bundle(Priority::Live).meta(0).version, 0);
+        assert!(BundleId::is_manifest_id("0123456789abcdef/show/manifest"));
+        assert!(!BundleId::is_manifest_id("0123456789abcdef/show/00001"));
     }
 
     #[test]

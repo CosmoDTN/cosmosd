@@ -94,6 +94,7 @@ mod tests {
                 lifetime_ms: Priority::Live.lifetime_ms(),
                 age_at_insert_ms: 0,
                 inserted_mono_ms: 0,
+                version: 0,
             })
             .collect()
     }

@@ -5,8 +5,11 @@
 //! content spreads through the mesh without any central coordination.
 //!
 //! Protocol v3 (CBOR frames, over any stream on the relay port):
-//!   1. Both sides send their manifest (version, relay port, id + priority)
-//!   2. Initiator orders the diff live-first and sends a pull request
+//!   1. Both sides send their manifest (version, relay port, and per bundle
+//!      its id, priority and content manifest version)
+//!   2. Initiator works out what it lacks, plus content manifests newer than
+//!      its own, orders them manifests first then live-first, and sends a
+//!      pull request
 //!   3. Responder streams requested bundles, in that order. Each bundle is
 //!      RFC 9171 bytes (`crate::wire`) inside a CBOR byte string.
 //!   4. Connection closes
@@ -17,6 +20,7 @@
 //! Every read is bounded by `FRAME_TIMEOUT`, so a blackholed link fails the
 //! session instead of hanging it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,7 +142,7 @@ impl EpidemicRouter {
             .store
             .all_meta()?
             .into_iter()
-            .map(|m| ManifestEntry { id: m.id.to_string(), priority: m.priority })
+            .map(|m| ManifestEntry { id: m.id, priority: m.priority, version: m.version })
             .collect();
         Ok(Manifest {
             protocol: PROTOCOL_VERSION,
@@ -180,7 +184,7 @@ impl EpidemicRouter {
         let peer_id = theirs.node_id.clone();
 
         // 3. Work out what we're missing, most urgent first
-        let our_ids = self.store.all_ids()?;
+        let our_ids: HashMap<String, u64> = self.store.all_meta()?.into_iter().map(|m| (m.id, m.version)).collect();
         let missing = pull_order(&theirs.entries, &our_ids, self.delay);
 
         info!(
@@ -326,13 +330,17 @@ mod tests {
             .unwrap()
     }
 
-    /// A signed live manifest listing `seqs` with their honest hashes.
+    /// A signed live manifest, version 1, listing `seqs` with their honest hashes.
     fn live_manifest(key: &PublisherKey, content: &str, seqs: std::ops::Range<u32>) -> Bundle {
+        live_manifest_v(key, content, 1, seqs)
+    }
+
+    fn live_manifest_v(key: &PublisherKey, content: &str, version: u64, seqs: std::ops::Range<u32>) -> Bundle {
         let m = ContentManifest {
             publisher: key.key_id(),
             content_id: content.into(),
             title: "Match".into(),
-            version: 1,
+            version,
             created_at_ms: 1_700_000_000_000,
             live: true,
             segments: seqs
@@ -354,7 +362,7 @@ mod tests {
         }
         let (a, b) = tokio::io::duplex(1 << 20);
         let (got, served) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
-        // Three segments (held, then promoted by the manifest) plus the manifest.
+        // The manifest, pulled first, plus three segments.
         assert_eq!(got.unwrap().received, 4);
         assert_eq!(served.unwrap().sent, 4);
         let id = format!("{}/m/00002", key.key_id());
@@ -375,8 +383,8 @@ mod tests {
         };
 
         // The manifest lists 0..4 with honest hashes. Segment 2 is flipped on
-        // the sending side. The first session pulls the segments before the
-        // manifest, so they are held and then checked on promotion.
+        // the sending side. The manifest is pulled first, so each segment is
+        // checked as it arrives. The held path is covered in the store tests.
         ground.store.insert(&live_manifest(&key, "m", 0..4)).unwrap();
         for s in 0..2 {
             ground.store.insert(&live_bundle(&key, "m", s)).unwrap();
@@ -396,8 +404,70 @@ mod tests {
         let id = |s: u32| format!("{}/m/{:05}", key.key_id(), s);
         assert!(gateway.store.get(&id(0)).unwrap().is_some());
         assert!(gateway.store.get(&id(1)).unwrap().is_some());
-        assert!(gateway.store.get(&id(2)).unwrap().is_none(), "tampered held segment stored");
+        assert!(gateway.store.get(&id(2)).unwrap().is_none(), "tampered segment 2 stored");
         assert!(gateway.store.get(&id(3)).unwrap().is_none(), "tampered segment stored");
+    }
+
+    /// One session with `from` serving `to`. Returns (received, sent).
+    async fn sync(to: &EpidemicRouter, from: &EpidemicRouter) -> (usize, usize) {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (got, served) = tokio::join!(to.initiate(a), from.handle_incoming(b));
+        (got.unwrap().received, served.unwrap().sent)
+    }
+
+    /// The version of the content manifest a router holds for `m`.
+    fn held_version(r: &EpidemicRouter, key: &PublisherKey) -> u64 {
+        let b = r.store.get(&format!("{}/m/manifest", key.key_id())).unwrap().expect("manifest held");
+        let m: ContentManifest = codec::decode(&SignedManifest::from_bytes(&b.payload).unwrap().manifest_cbor).unwrap();
+        m.version
+    }
+
+    #[tokio::test]
+    async fn peer_pulls_newer_manifest_version() {
+        let key = PublisherKey::generate();
+        let keys = Keys(vec![key.clone()]);
+        let a = router_trusting("a", 17778, vec![key.clone()]);
+        let b = router("b", 27778);
+        assert_eq!(a.store.admit(&live_manifest_v(&key, "m", 1, 0..1), &keys).unwrap(), Admission::Stored);
+        b.store.insert(&live_manifest_v(&key, "m", 2, 0..2)).unwrap();
+        assert_eq!(sync(&a, &b).await, (1, 1));
+        assert_eq!(held_version(&a, &key), 2);
+    }
+
+    #[tokio::test]
+    async fn peer_does_not_pull_equal_or_older_manifest() {
+        let key = PublisherKey::generate();
+        let keys = Keys(vec![key.clone()]);
+        let a = router_trusting("a", 17778, vec![key.clone()]);
+        assert_eq!(a.store.admit(&live_manifest_v(&key, "m", 2, 0..1), &keys).unwrap(), Admission::Stored);
+        for v in [1, 2] {
+            let b = router("b", 27778);
+            b.store.insert(&live_manifest_v(&key, "m", v, 0..3)).unwrap();
+            assert_eq!(sync(&a, &b).await, (0, 0), "version {v}");
+        }
+        assert_eq!(held_version(&a, &key), 2);
+    }
+
+    #[tokio::test]
+    async fn live_sequence_stores_segment_added_by_newer_manifest() {
+        let key = PublisherKey::generate();
+        let keys = Keys(vec![key.clone()]);
+        let a = router_trusting("a", 17778, vec![key.clone()]);
+        let b = router_trusting("b", 27778, vec![key.clone()]);
+        // B publishes version 1 with segments 0..2 (sequences 0, 1 and 2).
+        assert_eq!(b.store.admit(&live_manifest_v(&key, "m", 1, 0..3), &keys).unwrap(), Admission::Stored);
+        for s in 0..3 {
+            assert_eq!(b.store.admit(&live_bundle(&key, "m", s), &keys).unwrap(), Admission::Stored);
+        }
+        assert_eq!(sync(&a, &b).await, (4, 4));
+
+        // B publishes version 2 adding segment 3.
+        assert_eq!(b.store.admit(&live_manifest_v(&key, "m", 2, 0..4), &keys).unwrap(), Admission::Stored);
+        assert_eq!(b.store.admit(&live_bundle(&key, "m", 3), &keys).unwrap(), Admission::Stored);
+        assert_eq!(sync(&a, &b).await, (2, 2));
+        assert_eq!(held_version(&a, &key), 2);
+        let got = a.store.get(&format!("{}/m/00003", key.key_id())).unwrap().expect("segment 3 stored");
+        assert_eq!(got.payload, live_payload(3));
     }
 
     #[tokio::test]

@@ -349,12 +349,7 @@ async fn serve(
     sync_interval: u64,
     key_dir: PathBuf,
 ) -> Result<()> {
-    let node_id = node_id.unwrap_or_else(|| {
-        hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "cosmosd-node".to_string())
-    });
+    let node_id = resolve_node_id(node_id)?;
 
     auth::check_open_relay(relay_token.is_some(), open_relay, no_discovery)?;
 
@@ -463,6 +458,19 @@ async fn serve(
     Ok(())
 }
 
+/// `--node-id`, or the hostname, checked now: it goes into every bundle
+/// this node creates or forwards, so a bad one would fail every send.
+fn resolve_node_id(node_id: Option<String>) -> Result<String> {
+    let node_id = node_id.unwrap_or_else(|| {
+        hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "cosmosd-node".to_string())
+    });
+    wire::check_node_id(&node_id).context("pass a valid --node-id")?;
+    Ok(node_id)
+}
+
 /// The node's own key, if it has one, and a `Trust` of that key plus the keys
 /// paired in `key_dir`. A missing key dir gives a node that trusts nobody and
 /// can not ingest. Pairings are read once, so changes need a restart.
@@ -509,6 +517,16 @@ mod tests {
             assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", token]).is_err(), "{token:?}");
         }
         assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", "s3cret"]).is_ok());
+    }
+
+    #[test]
+    fn node_id_is_checked_at_startup() {
+        assert_eq!(resolve_node_id(Some("iss-node-1".into())).unwrap(), "iss-node-1");
+        for bad in ["", "a/b"] {
+            let err = resolve_node_id(Some(bad.into())).unwrap_err().to_string();
+            assert!(err.contains("--node-id"), "{bad:?}: {err}");
+        }
+        assert!(resolve_node_id(None).is_ok(), "the hostname is a valid node id here");
     }
 
     #[test]

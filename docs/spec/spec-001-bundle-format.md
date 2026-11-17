@@ -23,7 +23,7 @@ A bundle is a CBOR indefinite-length array. It holds the primary block, then the
 
 The payload block is always last, as RFC 9171 requires. The other blocks come in descending block number.
 
-The previous node block is present only when a node has forwarded the bundle. A new bundle has no previous node block.
+The previous node block is present only when a node has sent the bundle to a peer. A new bundle has no previous node block.
 
 ## Primary block
 
@@ -88,7 +88,7 @@ Each node that holds a bundle adds the time it held it to the age. This hold-tim
 
 ## Hop count
 
-The hop count block holds a hop limit of 255 and the current count. A new bundle has count 0. cosmosd does not enforce the limit yet.
+The hop count block holds a hop limit of 255 and the current count. A new bundle has count 0. Each cosmosd node raises the count by one when it sends the bundle to a peer, and puts its own node ID in the previous node block. cosmosd does not enforce the limit yet.
 
 ## Control flags
 

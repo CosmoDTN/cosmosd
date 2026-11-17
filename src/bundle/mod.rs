@@ -133,9 +133,9 @@ pub struct Bundle {
     /// Time the bundle has existed, summed over the nodes that held it.
     pub age_ms: u64,
     pub lifetime_ms: u64,
-    /// Transmission hop count (incremented at each relay).
+    /// Times the bundle has been sent to a peer. The sender raises it by one.
     pub hop_count: u8,
-    /// Node that last forwarded this bundle, if any.
+    /// Node that last sent this bundle to a peer. None until it is first sent.
     pub previous_node: Option<String>,
     /// Node that originally created this bundle.
     pub source_node: String,

@@ -119,6 +119,13 @@ fn check_node_name(what: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check that `name` can be this node's ID in the source and previous node
+/// fields of the bundles it sends.
+pub fn check_node_id(name: &str) -> Result<()> {
+    check_node_name("node id", name)?;
+    node_eid(name).map(|_| ())
+}
+
 // === Decode ===
 
 /// Decode and validate RFC 9171 bytes. Errors, never panics, on bad input.

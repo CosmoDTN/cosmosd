@@ -331,11 +331,14 @@ impl EpidemicRouter {
         // 3. Receive their pull request
         let pull: PullRequest = codec::decode(&recv_frame(&mut stream).await?)?;
 
-        // 4. Send requested bundles (empty frame if we don't have it)
+        // 4. Send requested bundles (empty frame if we don't have it). Each
+        //    one leaves with its hop count raised and this node as previous node.
         let mut sent = 0usize;
         for id in &pull.bundle_ids {
             match self.store.get(id)? {
-                Some(bundle) => {
+                Some(mut bundle) => {
+                    bundle.hop_count = bundle.hop_count.saturating_add(1);
+                    bundle.previous_node = Some(self.node_id.clone());
                     let bytes = wire::encode_bundle(&bundle)?;
                     send_frame(&mut stream, &codec::encode(&serde_bytes::Bytes::new(&bytes))?).await?;
                     sent += 1;
@@ -439,6 +442,28 @@ mod tests {
         let got = gateway.store.get(&id).unwrap().expect("pulled bundle");
         assert_eq!(got.payload, live_payload(2));
         assert_eq!(got.info.sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn each_hop_raises_hop_count_and_names_the_sender() {
+        let key = PublisherKey::generate();
+        let ground = router_trusting("ground", 17778, vec![key.clone()]);
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        let cabin = router_trusting("cabin", 37778, vec![key.clone()]);
+        ground.store.insert(&live_manifest(&key, "m", 0..1)).unwrap();
+        ground.store.insert(&live_bundle(&key, "m", 0)).unwrap();
+        let id = format!("{}/m/00000", key.key_id());
+
+        sync(&gateway, &ground).await;
+        let got = gateway.store.get(&id).unwrap().expect("pulled");
+        assert_eq!((got.hop_count, got.previous_node.as_deref()), (1, Some("ground")));
+        assert_eq!(got.source_node, "ground");
+
+        sync(&cabin, &gateway).await;
+        let got = cabin.store.get(&id).unwrap().expect("relayed");
+        assert_eq!((got.hop_count, got.previous_node.as_deref()), (2, Some("gateway")));
+        // The sender's own copy is unchanged.
+        assert_eq!(ground.store.get(&id).unwrap().unwrap().hop_count, 0);
     }
 
     #[tokio::test]

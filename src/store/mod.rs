@@ -222,6 +222,38 @@ impl BundleStore {
         Ok(self.all_meta()?.into_iter().map(|m| m.id).collect())
     }
 
+    /// What this node offers peers: every valid manifest, and each valid
+    /// segment that its stored manifest lists. A segment no manifest lists
+    /// would only be held and then dropped by peers, so it is not offered.
+    pub fn advertised_meta(&self) -> Result<Vec<BundleMeta>> {
+        let all = self.all_meta()?;
+        let mut listed: HashMap<(&KeyId, &str), HashSet<u32>> = HashMap::new();
+        for m in all.iter().filter(|m| m.kind == BundleKind::Manifest) {
+            if let Some(man) = self.manifest(&m.publisher, &m.content_id)? {
+                listed.insert((&m.publisher, &m.content_id), man.segments.iter().map(|s| s.sequence).collect());
+            }
+        }
+        let offered = |m: &BundleMeta| {
+            m.kind == BundleKind::Manifest
+                || listed.get(&(&m.publisher, m.content_id.as_str())).is_some_and(|seqs| seqs.contains(&m.sequence))
+        };
+        let keep: Vec<bool> = all.iter().map(offered).collect();
+        Ok(all.into_iter().zip(keep).filter_map(|(m, k)| k.then_some(m)).collect())
+    }
+
+    /// Ids of the segments waiting in `pending` for their manifest.
+    pub fn held_ids(&self) -> Result<HashSet<String>> {
+        let now = self.clock.now_ms();
+        let mut out = HashSet::new();
+        for item in self.pending.iter() {
+            let (key, value) = item?;
+            if decode::<HeldSegment>(&value).is_ok_and(|h| !h.hold_expired(now)) {
+                out.insert(String::from_utf8_lossy(&key).into_owned());
+            }
+        }
+        Ok(out)
+    }
+
     /// Remove expired bundles. Call periodically from background task.
     pub fn reap_expired(&self) -> Result<usize> {
         let now = self.clock.now_ms();

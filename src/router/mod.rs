@@ -6,10 +6,12 @@
 //!
 //! Protocol v3 (CBOR frames, over any stream on the relay port):
 //!   1. Both sides send their manifest (version, relay port, and per bundle
-//!      its id, priority and content manifest version)
+//!      its id, priority and content manifest version). It lists every
+//!      content manifest and the segments those manifests list.
 //!   2. Initiator works out what it lacks, plus content manifests newer than
 //!      its own, orders them manifests first then live-first, and sends a
-//!      pull request
+//!      pull request. It skips ids from untrusted publishers, ids it holds
+//!      waiting for a manifest, and ids it already rejected in this process.
 //!   3. Responder streams requested bundles, in that order. Each bundle is
 //!      RFC 9171 bytes (`crate::wire`) inside a CBOR byte string.
 //!   4. Connection closes
@@ -20,8 +22,8 @@
 //! Every read is bounded by `FRAME_TIMEOUT`, so a blackholed link fails the
 //! session instead of hanging it.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -32,9 +34,10 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::auth::authenticate_outgoing;
+use crate::bundle::BundleKind;
 use crate::codec::{self, PROTOCOL_VERSION};
 use crate::store::{Admission, BundleStore};
-use crate::trust::KeyLookup;
+use crate::trust::{KeyId, KeyLookup};
 use crate::wire;
 
 mod order;
@@ -104,6 +107,47 @@ async fn recv_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+// === Rejected ids ===
+
+/// Most rejected ids the router remembers.
+pub const REJECT_CACHE_SIZE: usize = 4096;
+
+/// Ids the admission gate rejected in this process, so they are not pulled
+/// again every session. A manifest is keyed with its version, so a newer
+/// version is still pulled. Bounded: the oldest entry goes first.
+#[derive(Default)]
+struct RejectCache {
+    order: VecDeque<(String, u64)>,
+    set: HashSet<(String, u64)>,
+}
+
+impl RejectCache {
+    fn insert(&mut self, id: &str, version: u64) {
+        let key = (id.to_string(), version);
+        if !self.set.insert(key.clone()) {
+            return;
+        }
+        self.order.push_back(key);
+        if self.order.len() > REJECT_CACHE_SIZE {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
+
+    fn contains(&self, id: &str, version: u64) -> bool {
+        self.set.contains(&(id.to_string(), version))
+    }
+
+    /// Forget a content's rejections. A segment refused against one manifest
+    /// version can be listed by the next.
+    fn forget_content(&mut self, publisher: &str, content_id: &str) {
+        let prefix = format!("{publisher}/{content_id}/");
+        self.order.retain(|(id, _)| !id.starts_with(&prefix));
+        self.set.retain(|(id, _)| !id.starts_with(&prefix));
+    }
+}
+
 // === Sync stats ===
 
 #[derive(Debug)]
@@ -123,6 +167,8 @@ pub struct EpidemicRouter {
     delay: Duration,
     /// Publishers whose bundles we accept from peers.
     trust: Arc<dyn KeyLookup + Send + Sync>,
+    /// Ids rejected in this process, not pulled again.
+    rejected: Mutex<RejectCache>,
 }
 
 impl EpidemicRouter {
@@ -133,14 +179,25 @@ impl EpidemicRouter {
         delay: Duration,
         trust: Arc<dyn KeyLookup + Send + Sync>,
     ) -> Self {
-        EpidemicRouter { store, node_id, relay_port, delay, trust }
+        EpidemicRouter { store, node_id, relay_port, delay, trust, rejected: Mutex::default() }
     }
 
-    /// Our manifest: every valid bundle we hold, with its priority.
+    fn rejected(&self) -> std::sync::MutexGuard<'_, RejectCache> {
+        self.rejected.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// True when a peer's entry could pass our admission gate: its publisher
+    /// is trusted and we have not already rejected it.
+    fn worth_pulling(&self, e: &ManifestEntry) -> bool {
+        let publisher = e.id.split('/').next().unwrap_or_default();
+        self.trust.lookup(&KeyId(publisher.to_string())).is_some() && !self.rejected().contains(&e.id, e.version)
+    }
+
+    /// Our manifest: every valid manifest we hold, and the segments they list.
     fn manifest(&self) -> Result<Manifest> {
         let entries = self
             .store
-            .all_meta()?
+            .advertised_meta()?
             .into_iter()
             .map(|m| ManifestEntry { id: m.id, priority: m.priority, version: m.version })
             .collect();
@@ -183,9 +240,16 @@ impl EpidemicRouter {
         let theirs = Self::parse_manifest(&recv_frame(&mut stream).await?)?;
         let peer_id = theirs.node_id.clone();
 
-        // 3. Work out what we're missing, most urgent first
-        let our_ids: HashMap<String, u64> = self.store.all_meta()?.into_iter().map(|m| (m.id, m.version)).collect();
-        let missing = pull_order(&theirs.entries, &our_ids, self.delay);
+        // 3. Work out what we're missing, most urgent first. Held segments
+        //    count as ours, and ids we could never admit are skipped, so they
+        //    never take the session's non-urgent slots.
+        let mut our_ids: HashMap<String, u64> = self.store.all_meta()?.into_iter().map(|m| (m.id, m.version)).collect();
+        for id in self.store.held_ids()? {
+            our_ids.entry(id).or_insert(0);
+        }
+        let candidates: Vec<ManifestEntry> = theirs.entries.iter().filter(|e| self.worth_pulling(e)).cloned().collect();
+        let missing = pull_order(&candidates, &our_ids, self.delay);
+        let versions: HashMap<&str, u64> = candidates.iter().map(|e| (e.id.as_str(), e.version)).collect();
 
         info!(
             "Peer {}: they have {}, we have {}, missing {}",
@@ -216,11 +280,17 @@ impl EpidemicRouter {
                 }
             };
             match self.store.admit(&bundle, &*self.trust)? {
-                Admission::Stored => received += 1,
+                Admission::Stored => {
+                    received += 1;
+                    if bundle.info.kind == BundleKind::Manifest {
+                        self.rejected().forget_content(&bundle.publisher.0, &bundle.info.content_id);
+                    }
+                }
                 Admission::Duplicate => debug!("Already have bundle {}", id),
                 Admission::Held => held.push(id),
                 Admission::Rejected(reason) => {
                     warn!("Rejected bundle {} from {}: {}", id, peer_id, reason);
+                    self.rejected().insert(id, versions.get(id.as_str()).copied().unwrap_or(0));
                     rejected += 1;
                 }
             }
@@ -481,6 +551,159 @@ mod tests {
         let (got, _) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
         assert_eq!(got.unwrap().received, 0);
         assert!(gateway.store.all_ids().unwrap().is_empty());
+    }
+
+    // === Ids that will never be admitted ===
+
+    fn vod_bundle(key: &PublisherKey, content: &str, seq: u32) -> Bundle {
+        Bundle::segment(&key.key_id(), content, "Film", seq, "video/mp2t", Priority::Vod, live_payload(seq), "ground")
+            .unwrap()
+    }
+
+    fn vod_manifest(key: &PublisherKey, content: &str, seqs: std::ops::Range<u32>) -> Bundle {
+        let m = ContentManifest {
+            publisher: key.key_id(),
+            content_id: content.into(),
+            title: "Film".into(),
+            version: 1,
+            created_at_ms: 1_700_000_000_000,
+            live: false,
+            segments: seqs
+                .map(|s| SegmentEntry { sequence: s, hash: *blake3::hash(&live_payload(s)).as_bytes(), duration_ms: 10_000 })
+                .collect(),
+        };
+        let signed = SignedManifest::sign(&m, key).unwrap().to_bytes().unwrap();
+        Bundle::manifest(&key.key_id(), &m, signed, "ground")
+    }
+
+    /// Run `gateway.initiate` against a scripted peer that advertises
+    /// `entries` and has none of them. Returns the ids the gateway asked for.
+    async fn pull_request_for(gateway: &EpidemicRouter, entries: Vec<ManifestEntry>) -> Vec<String> {
+        let (a, mut b) = tokio::io::duplex(1 << 16);
+        let peer = async move {
+            recv_frame(&mut b).await.unwrap();
+            let m = Manifest { protocol: PROTOCOL_VERSION, node_id: "peer".into(), relay_port: 1, entries };
+            send_frame(&mut b, &codec::encode(&m).unwrap()).await.unwrap();
+            let pull: PullRequest = codec::decode(&recv_frame(&mut b).await.unwrap()).unwrap();
+            for _ in &pull.bundle_ids {
+                send_frame(&mut b, &[]).await.unwrap();
+            }
+            pull.bundle_ids
+        };
+        let (got, ids) = tokio::join!(gateway.initiate(a), peer);
+        got.unwrap();
+        ids
+    }
+
+    #[tokio::test]
+    async fn unpaired_vod_does_not_block_paired_vod() {
+        // The VOD tail is sorted by id, publisher first. Pick keys so the
+        // unpaired one sorts first: without the trust filter its segments
+        // would take every non-urgent slot in every session.
+        let (mut unpaired, mut paired) = (PublisherKey::generate(), PublisherKey::generate());
+        if unpaired.key_id().0 > paired.key_id().0 {
+            std::mem::swap(&mut unpaired, &mut paired);
+        }
+        let ground = router("ground", 17778);
+        let gateway = router_trusting("gateway", 27778, vec![paired.clone()]);
+        for (key, content) in [(&unpaired, "a"), (&paired, "b")] {
+            ground.store.insert(&vod_manifest(key, content, 0..3)).unwrap();
+            for s in 0..3 {
+                ground.store.insert(&vod_bundle(key, content, s)).unwrap();
+            }
+        }
+        sync(&gateway, &ground).await;
+        sync(&gateway, &ground).await;
+        for s in 0..3 {
+            let id = format!("{}/b/{:05}", paired.key_id(), s);
+            assert!(gateway.store.get(&id).unwrap().is_some(), "paired segment {s} not pulled");
+        }
+        assert!(gateway.store.all_meta().unwrap().iter().all(|m| m.publisher == paired.key_id()));
+    }
+
+    #[tokio::test]
+    async fn rejected_segment_is_not_requested_again() {
+        let key = PublisherKey::generate();
+        let ground = router("ground", 17778);
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        ground.store.insert(&vod_manifest(&key, "f", 0..3)).unwrap();
+        let mut tampered = vod_bundle(&key, "f", 0);
+        tampered.payload[0] ^= 1;
+        ground.store.insert(&tampered).unwrap();
+        for s in 1..3 {
+            ground.store.insert(&vod_bundle(&key, "f", s)).unwrap();
+        }
+        // The manifest, then segments 0 (rejected) and 1.
+        assert_eq!(sync(&gateway, &ground).await, (2, 3));
+        // Only segment 2. Segment 0 is not asked for again.
+        assert_eq!(sync(&gateway, &ground).await, (1, 1));
+        assert_eq!(sync(&gateway, &ground).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn held_segment_is_not_pulled_again() {
+        let key = PublisherKey::generate();
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        let s = vod_bundle(&key, "f", 0);
+        assert_eq!(gateway.store.admit(&s, &Keys(vec![key.clone()])).unwrap(), Admission::Held);
+        let entry = ManifestEntry { id: s.id().0, priority: Priority::Vod, version: 0 };
+        assert!(pull_request_for(&gateway, vec![entry]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn untrusted_publisher_ids_are_not_requested() {
+        let (stranger, friend) = (PublisherKey::generate(), PublisherKey::generate());
+        let gateway = router_trusting("gateway", 27778, vec![friend.clone()]);
+        let entry = |key: &PublisherKey, rest: &str, version| ManifestEntry {
+            id: format!("{}/{rest}", key.key_id()),
+            priority: Priority::Vod,
+            version,
+        };
+        let entries = vec![entry(&stranger, "f/manifest", 1), entry(&stranger, "f/00000", 0), entry(&friend, "f/manifest", 1)];
+        assert_eq!(pull_request_for(&gateway, entries).await, vec![format!("{}/f/manifest", friend.key_id())]);
+    }
+
+    #[tokio::test]
+    async fn segment_without_a_listing_manifest_is_not_advertised() {
+        let key = PublisherKey::generate();
+        let node = router_trusting("node", 17778, vec![key.clone()]);
+        node.store.insert(&vod_bundle(&key, "f", 0)).unwrap();
+        assert!(node.manifest().unwrap().entries.is_empty());
+
+        // After finish, the manifest lists it, so both are offered.
+        node.store.insert(&vod_manifest(&key, "f", 0..1)).unwrap();
+        let mut ids: Vec<String> = node.manifest().unwrap().entries.into_iter().map(|e| e.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![format!("{}/f/00000", key.key_id()), format!("{}/f/manifest", key.key_id())]);
+
+        // A live segment waits for the rolling manifest that lists it.
+        node.store.insert(&live_manifest(&key, "m", 0..1)).unwrap();
+        node.store.insert(&live_bundle(&key, "m", 0)).unwrap();
+        node.store.insert(&live_bundle(&key, "m", 1)).unwrap();
+        let ids: Vec<String> = node.manifest().unwrap().entries.into_iter().map(|e| e.id).collect();
+        assert!(ids.contains(&format!("{}/m/00000", key.key_id())));
+        assert!(!ids.contains(&format!("{}/m/00001", key.key_id())));
+    }
+
+    #[test]
+    fn reject_cache_is_bounded_and_forgets_a_content() {
+        let mut cache = RejectCache::default();
+        cache.insert("p/a/00000", 0);
+        cache.insert("p/a/manifest", 3);
+        cache.insert("p/b/00000", 0);
+        assert!(cache.contains("p/a/00000", 0));
+        // A rejected manifest version does not block a newer one.
+        assert!(cache.contains("p/a/manifest", 3) && !cache.contains("p/a/manifest", 4));
+        cache.forget_content("p", "a");
+        assert!(!cache.contains("p/a/00000", 0) && !cache.contains("p/a/manifest", 3));
+        assert!(cache.contains("p/b/00000", 0));
+
+        for i in 0..REJECT_CACHE_SIZE {
+            cache.insert(&format!("p/c/{i:05}"), 0);
+        }
+        assert_eq!(cache.order.len(), REJECT_CACHE_SIZE);
+        assert!(!cache.contains("p/b/00000", 0), "oldest entry evicted");
+        assert!(cache.contains(&format!("p/c/{:05}", REJECT_CACHE_SIZE - 1), 0));
     }
 
     #[tokio::test]

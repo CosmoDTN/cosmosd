@@ -113,17 +113,22 @@ async fn recv_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
 pub const REJECT_CACHE_SIZE: usize = 4096;
 
 /// Ids the admission gate rejected in this process, so they are not pulled
-/// again every session. A manifest is keyed with its version, so a newer
-/// version is still pulled. Bounded: the oldest entry goes first.
+/// again every session. An entry names the peer that sent the bad copy, so
+/// one bad peer can not block an id that other peers hold. A manifest is
+/// keyed with its version, so a newer version is still pulled. Bounded: the
+/// oldest entry goes first.
 #[derive(Default)]
 struct RejectCache {
-    order: VecDeque<(String, u64)>,
-    set: HashSet<(String, u64)>,
+    order: VecDeque<RejectKey>,
+    set: HashSet<RejectKey>,
 }
 
+/// Peer node ID, bundle ID and advertised version.
+type RejectKey = (String, String, u64);
+
 impl RejectCache {
-    fn insert(&mut self, id: &str, version: u64) {
-        let key = (id.to_string(), version);
+    fn insert(&mut self, peer: &str, id: &str, version: u64) {
+        let key = (peer.to_string(), id.to_string(), version);
         if !self.set.insert(key.clone()) {
             return;
         }
@@ -135,16 +140,16 @@ impl RejectCache {
         }
     }
 
-    fn contains(&self, id: &str, version: u64) -> bool {
-        self.set.contains(&(id.to_string(), version))
+    fn contains(&self, peer: &str, id: &str, version: u64) -> bool {
+        self.set.contains(&(peer.to_string(), id.to_string(), version))
     }
 
     /// Forget a content's rejections. A segment refused against one manifest
     /// version can be listed by the next.
     fn forget_content(&mut self, publisher: &str, content_id: &str) {
         let prefix = format!("{publisher}/{content_id}/");
-        self.order.retain(|(id, _)| !id.starts_with(&prefix));
-        self.set.retain(|(id, _)| !id.starts_with(&prefix));
+        self.order.retain(|(_, id, _)| !id.starts_with(&prefix));
+        self.set.retain(|(_, id, _)| !id.starts_with(&prefix));
     }
 }
 
@@ -187,10 +192,10 @@ impl EpidemicRouter {
     }
 
     /// True when a peer's entry could pass our admission gate: its publisher
-    /// is trusted and we have not already rejected it.
-    fn worth_pulling(&self, e: &ManifestEntry) -> bool {
+    /// is trusted and we have not already rejected that peer's copy.
+    fn worth_pulling(&self, peer: &str, e: &ManifestEntry) -> bool {
         let publisher = e.id.split('/').next().unwrap_or_default();
-        self.trust.lookup(&KeyId(publisher.to_string())).is_some() && !self.rejected().contains(&e.id, e.version)
+        self.trust.lookup(&KeyId(publisher.to_string())).is_some() && !self.rejected().contains(peer, &e.id, e.version)
     }
 
     /// Our manifest: every valid manifest we hold, and the segments they list.
@@ -247,7 +252,7 @@ impl EpidemicRouter {
         for id in self.store.held_ids()? {
             our_ids.entry(id).or_insert(0);
         }
-        let candidates: Vec<ManifestEntry> = theirs.entries.iter().filter(|e| self.worth_pulling(e)).cloned().collect();
+        let candidates: Vec<ManifestEntry> = theirs.entries.iter().filter(|e| self.worth_pulling(&peer_id, e)).cloned().collect();
         let missing = pull_order(&candidates, &our_ids, self.delay);
         let versions: HashMap<&str, u64> = candidates.iter().map(|e| (e.id.as_str(), e.version)).collect();
 
@@ -290,7 +295,7 @@ impl EpidemicRouter {
                 Admission::Held => held.push(id),
                 Admission::Rejected(reason) => {
                     warn!("Rejected bundle {} from {}: {}", id, peer_id, reason);
-                    self.rejected().insert(id, versions.get(id.as_str()).copied().unwrap_or(0));
+                    self.rejected().insert(&peer_id, id, versions.get(id.as_str()).copied().unwrap_or(0));
                     rejected += 1;
                 }
             }
@@ -713,22 +718,24 @@ mod tests {
     #[test]
     fn reject_cache_is_bounded_and_forgets_a_content() {
         let mut cache = RejectCache::default();
-        cache.insert("p/a/00000", 0);
-        cache.insert("p/a/manifest", 3);
-        cache.insert("p/b/00000", 0);
-        assert!(cache.contains("p/a/00000", 0));
+        cache.insert("bad", "p/a/00000", 0);
+        cache.insert("bad", "p/a/manifest", 3);
+        cache.insert("bad", "p/b/00000", 0);
+        assert!(cache.contains("bad", "p/a/00000", 0));
+        // Another peer's copy of the same id is still worth pulling.
+        assert!(!cache.contains("good", "p/a/00000", 0));
         // A rejected manifest version does not block a newer one.
-        assert!(cache.contains("p/a/manifest", 3) && !cache.contains("p/a/manifest", 4));
+        assert!(cache.contains("bad", "p/a/manifest", 3) && !cache.contains("bad", "p/a/manifest", 4));
         cache.forget_content("p", "a");
-        assert!(!cache.contains("p/a/00000", 0) && !cache.contains("p/a/manifest", 3));
-        assert!(cache.contains("p/b/00000", 0));
+        assert!(!cache.contains("bad", "p/a/00000", 0) && !cache.contains("bad", "p/a/manifest", 3));
+        assert!(cache.contains("bad", "p/b/00000", 0));
 
         for i in 0..REJECT_CACHE_SIZE {
-            cache.insert(&format!("p/c/{i:05}"), 0);
+            cache.insert("bad", &format!("p/c/{i:05}"), 0);
         }
         assert_eq!(cache.order.len(), REJECT_CACHE_SIZE);
-        assert!(!cache.contains("p/b/00000", 0), "oldest entry evicted");
-        assert!(cache.contains(&format!("p/c/{:05}", REJECT_CACHE_SIZE - 1), 0));
+        assert!(!cache.contains("bad", "p/b/00000", 0), "oldest entry evicted");
+        assert!(cache.contains("bad", &format!("p/c/{:05}", REJECT_CACHE_SIZE - 1), 0));
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 name = "cosmosd"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Delay-tolerant streaming daemon — stream across the void"
 license = "MIT"
 repository = "https://github.com/CosmoDTN/cosmosd"

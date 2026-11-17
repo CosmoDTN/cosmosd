@@ -2,9 +2,9 @@
 
 # cosmosd
 
-**Delay-tolerant streaming daemon — stream across the void.**
+**Delay-tolerant streaming daemon. Stream across the void.**
 
-`cosmosd` is the core relay node for the CosmoDTN framework. It stores HLS video segments as BPv7-inspired bundles, forwards them hop-by-hop to peers over any available link, and serves them to local players via a standard HTTP/HLS API.
+`cosmosd` is the core relay node for the CosmoDTN framework. It stores HLS video segments as RFC 9171 (BPv7) bundles with a private content block. It forwards them hop by hop to peers and serves them to local players over a standard HTTP and HLS API.
 
 Designed for networks where internet connectivity is absent, intermittent, or extremely high-latency: space stations, aircraft, submarines, remote villages, disaster zones.
 
@@ -20,16 +20,16 @@ Viewers watch via any HLS player pointed at `http://localhost:7777/play/{content
 
 ```
 [Ingest node]          [Relay node]          [Viewer node]
-cosmoscast-ingest  →   cosmosd stores    →   cosmosd serves
+cosmosd ingest     →   cosmosd stores    →   cosmosd serves
 POST /ingest           epidemic sync         GET /play/...
-                        TCP / BLE / LoRa      HLS player
+                       over TCP              HLS player
 ```
 
 ---
 
 ## Install
 
-### macOS — Homebrew (recommended)
+### macOS with Homebrew (recommended)
 
 ```bash
 brew tap CosmoDTN/tap
@@ -152,7 +152,7 @@ All options:
 | `--relay-port` | `7778` | TCP relay port (peer-to-peer bundle sync) |
 | `--peer` | — | Known peer relay address, `host:port` or `host:port@token` (token after the first `@`, presented only to that peer); pass multiple times |
 | `--store` | `.cosmosd/store` | Bundle store directory |
-| `--node-id` | hostname | Human-readable node identifier |
+| `--node-id` | hostname | Human-readable node identifier. It travels in every bundle this node creates or forwards. It must be non-empty and free of `/`, and `serve` checks it at startup |
 | `--relay-token` | — | Shared secret guarding our relay port; peers that dial us must present it. It is not sent to peers we dial |
 | `--open-relay` | false | Allow a relay with no `--relay-token` with `--no-discovery` or on a machine that has a public IPv4 address (otherwise `serve` refuses to start) |
 | `--no-discovery` | false | Disable discovery: no mDNS, and peers that connect in are not dialed back. This is the ground role, so it needs `--relay-token` (or `--open-relay`) |
@@ -184,12 +184,21 @@ cosmosd keys unpair <key id>   # stop trusting a publisher
 
 Keys live in `$HOME/.config/cosmosd`. Pass `--key-dir` to `keys` and `serve`
 to use another directory. The key file is the node's identity. Do not copy it
-to other machines and do not commit it.
+to other machines and do not commit it. A publisher key made inside a
+container is lost with the container, so mount a key dir from the host.
+
+Two nodes on one machine share `$HOME/.config/cosmosd` unless you pass
+`--key-dir`. Give each its own `--key-dir` to test pairing on one machine.
+
+The default node ID is the machine's hostname. It travels in every bundle the
+node creates or forwards, so pass `--node-id` if you do not want to share it.
 
 Ingest signs content under the node's key. For each content item the node
 publishes a signed manifest. The manifest lists every segment with its BLAKE3
 hash. A live stream gets a new manifest version after each segment, listing
 the last 180 segments. A file gets its manifest when `cosmosd ingest` finishes.
+A segment added after `finish` is not in that manifest, so peers drop it
+until `finish` runs again and publishes a new version.
 Without a key, `POST /ingest` answers 409 with `run cosmosd keys init first`.
 
 A node stores a bundle from a peer only when it checks out:
@@ -210,7 +219,7 @@ or where the live edge sits, but not the video itself.
 
 A node refuses a manifest only when it holds a newer one. Once its manifest
 expires it accepts an older signed version again, so a peer can replay an old
-version of the content for a while.
+version of the content until that version expires.
 
 A new live manifest is the publisher's whole window. When one is stored, the
 node drops the segments of that stream that it does not list. A publisher
@@ -308,8 +317,8 @@ It checks that the short cut causes no stall, the long one does, and playback
 ends about 2 minutes behind live, then prints `DEMO PASS` or `DEMO FAIL: <why>`.
 The ground node gets a fresh key and the other two pair it. All three key dirs
 are temp dirs, so the run never touches your own keys.
-Watch along with `ffplay http://127.0.0.1:37777/play/demo`; logs are kept in the
-temp directory it prints. If mDNS can't work on your machine,
+Watch along with `ffplay -extension_picky 0 http://127.0.0.1:37777/play/demo`.
+Logs are kept in the temp directory it prints. If mDNS can't work on your machine,
 `DEMO_CABIN_PEER=1` gives the cabin an explicit `--peer` to the gateway instead.
 
 ---
@@ -350,7 +359,7 @@ curl -s -X POST http://localhost:7777/ingest \
   -H "Content-Type: application/json" \
   -d "{
     \"content_id\": \"my_show_ep1\",
-    \"content_title\": \"My Show — Episode 1\",
+    \"content_title\": \"My Show, Episode 1\",
     \"sequence\": 1,
     \"mime_type\": \"video/mp2t\",
     \"priority\": \"vod\",
@@ -379,9 +388,10 @@ publisher ID.
 http://localhost:7777/play/<publisher>/my_show_ep1
 ```
 
-Or with `ffplay`:
+Or with `ffplay`. ffmpeg 8 refuses segment URLs that have no file extension
+unless you pass `-extension_picky 0` (checked with ffmpeg 8.1.2):
 ```bash
-ffplay http://localhost:7777/play/my_show_ep1
+ffplay -extension_picky 0 http://localhost:7777/play/<publisher>/my_show_ep1
 ```
 
 ---
@@ -390,9 +400,14 @@ ffplay http://localhost:7777/play/my_show_ep1
 
 | Priority | TTL | Routing |
 |----------|-----|---------|
-| `live` | 30 minutes | Aggressive — any available link |
+| `live` | 30 minutes | Aggressive, any available link |
 | `near_live` | 6 hours | Best-effort |
 | `vod` | 30 days | Carry indefinitely |
+
+Each sync session pulls every missing live or near-live segment in the delay
+window, but at most 2 other segments (backfill and VOD). With the default 5 second
+`--sync-interval`, VOD moves about 2 segments per session. A 2 hour film is
+about 720 segments, so it takes about 30 minutes to cross one hop.
 
 A bundle expires by age, not by wall clock. Its lifetime comes from its
 priority. Its age counts how long it has existed. Each node adds the time it
@@ -400,8 +415,8 @@ held the bundle before passing it on. The bundle expires when its age reaches
 its lifetime. A node with a wrong clock still expires bundles on time.
 
 Each node measures held time on a clock that only moves forward. It saves that
-clock every 5 minutes and on a clean stop. Time while a node is off is not
-counted. Expired bundles are reaped automatically every 5 minutes.
+clock every 5 minutes and on a clean stop. Time while a node is off, or while
+its OS is suspended, is not counted. Expired bundles are reaped automatically every 5 minutes.
 
 ---
 
@@ -410,17 +425,17 @@ counted. Expired bundles are reaped automatically every 5 minutes.
 ```
 cosmosd
 ├── src/
-│   ├── main.rs          — CLI, startup, background task wiring
-│   ├── bundle/          — Bundle and content info, keyed by publisher
-│   ├── wire/            — RFC 9171 encoding of bundles
-│   ├── trust/           — Publisher keys, pairing and signed manifests
-│   ├── store/           — Bundle store (sled), age-based expiry, admission checks
-│   ├── router/          — Epidemic routing logic
-│   ├── peer/            — Peer manager: outgoing sync + relay listener
-│   ├── transport/       — Convergence layer trait + TCP implementation
-│   ├── discovery/       — mDNS peer auto-discovery
-│   ├── auth/            — Optional relay token authentication
-│   └── api/             — Local HTTP API (axum)
+│   ├── main.rs            CLI, startup, background task wiring
+│   ├── bundle/            Bundle and content info, keyed by publisher
+│   ├── wire/              RFC 9171 encoding of bundles
+│   ├── trust/             Publisher keys, pairing and signed manifests
+│   ├── store/             Bundle store (sled), age-based expiry, admission checks
+│   ├── router/            Epidemic routing logic
+│   ├── peer/              Peer manager: outgoing sync + relay listener
+│   ├── transport/         Convergence layer trait + TCP implementation
+│   ├── discovery/         mDNS peer auto-discovery
+│   ├── auth/              Optional relay token authentication
+│   └── api/               Local HTTP API (axum)
 ```
 
 ---

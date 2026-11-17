@@ -1,17 +1,23 @@
 # Writing a CosmosD Transport Plugin
 
 A transport plugin (convergence layer) teaches cosmosd how to carry bundles
-over a new physical medium — LoRa, Reticulum, Bluetooth, ham radio, USB, laser.
+over a new physical medium, such as LoRa, Reticulum, Bluetooth, ham radio, USB
+or laser. Today cosmosd ships only TCP.
 
 ## The interface
+
+cosmosd is a binary crate. It has no library target, so another crate can not
+`use cosmosd::...` yet. Write a transport inside this repo, next to the TCP
+one. The traits are in `src/transport/mod.rs`. The TCP transport is in
+`src/transport/tcp.rs`. The RFC 9171 encoding is in `src/wire/mod.rs`.
 
 Implement three traits in Rust:
 
 ```rust
 use async_trait::async_trait;
 use anyhow::Result;
-use cosmosd::transport::{BundleStream, BundleListener, ConvergenceLayer, PeerAddr};
-use cosmosd::bundle::Bundle;
+use crate::transport::{BundleStream, BundleListener, ConvergenceLayer, PeerAddr};
+use crate::bundle::Bundle;
 
 // 1. A bidirectional bundle stream with one peer
 pub struct MyStream { /* your connection state */ }
@@ -42,7 +48,7 @@ impl BundleListener for MyListener {
     }
 }
 
-// 3. The convergence layer — entry point cosmosd calls
+// 3. The convergence layer, the entry point cosmosd calls
 pub struct MyTransport { /* config: frequency, baud rate, device path, etc. */ }
 
 #[async_trait]
@@ -69,8 +75,8 @@ Bundles travel as RFC 9171 (BPv7) bytes, with a length prefix over your stream:
 [ 4 bytes: bundle length (big-endian u32) ][ N bytes: RFC 9171 bundle ]
 ```
 
-`cosmosd::wire::encode_bundle` and `decode_bundle` turn a `Bundle` into those
-bytes and back. See `src/transport/tcp.rs` for the exact framing. Reuse it if
+`encode_bundle` and `decode_bundle` in `src/wire/mod.rs` turn a `Bundle` into
+those bytes and back. See `src/transport/tcp.rs` for the exact framing. Reuse it if
 your medium is stream-oriented. For datagram media (LoRa, UDP), adapt as needed.
 
 ## What a transport can rely on
@@ -100,7 +106,8 @@ node does that before it stores anything.
 
 ## Naming convention
 
-Publish your transport as a separate crate and repo:
+Once cosmosd has a library target, a transport can live in its own crate and
+repo. Use these names:
 
 ```
 Crate:  cosmosd-transport-lora

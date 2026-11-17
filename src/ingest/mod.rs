@@ -123,7 +123,7 @@ pub(crate) async fn check_daemon(client: &reqwest::Client, daemon: &str) -> Resu
         .get(format!("{}/health", daemon))
         .send()
         .await
-        .context("Cannot reach cosmosd — is it running? cosmosd serve")?
+        .context("Cannot reach cosmosd. Is it running? Start it with cosmosd serve")?
         .json()
         .await
         .context("Bad /health response")?;
@@ -164,7 +164,7 @@ pub async fn ingest_file(
     let content_id = content_id_from_name(&file.file_stem().unwrap_or_default().to_string_lossy());
 
     // 1. Check ffmpeg is available
-    which_ffmpeg().context("ffmpeg not found — install it: apt install ffmpeg / brew install ffmpeg")?;
+    which_ffmpeg().context("ffmpeg not found. Install it with apt install ffmpeg or brew install ffmpeg")?;
 
     // 2. Check daemon is reachable and can sign
     let client = reqwest::Client::new();
@@ -219,7 +219,7 @@ pub async fn ingest_file(
     info!("Manifest {} version {}", data["manifest_id"], data["version"]);
 
     info!("Done: {} ({} segments)", title, entries.len());
-    info!("Play: ffplay {}/play/{}/{}", daemon, publisher, content_id);
+    info!("Play: ffplay -extension_picky 0 {}/play/{}/{}", daemon, publisher, content_id);
     Ok(())
 }
 

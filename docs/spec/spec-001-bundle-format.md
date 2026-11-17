@@ -84,7 +84,7 @@ A manifest for live content gets the live lifetime. Other manifests get the VOD 
 
 The bundle age block holds the bundle's age in milliseconds. A new bundle has age 0. A bundle is valid while its age is below its lifetime. Wall clocks are never compared.
 
-Each node that holds a bundle adds the time it held it to the age. This hold-time accounting is part of the store and arrives with the age-based store.
+Each node that holds a bundle adds the time it held it to the age. The store keeps this count, so a bundle leaves a node with its age brought up to date.
 
 ## Hop count
 

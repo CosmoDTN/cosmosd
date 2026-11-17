@@ -58,7 +58,7 @@ pub async fn ingest_live(
     daemon: String,
     max_kbps: u32,
 ) -> Result<()> {
-    which_ffmpeg().context("ffmpeg not found — install it: apt install ffmpeg / brew install ffmpeg")?;
+    which_ffmpeg().context("ffmpeg not found. Install it with apt install ffmpeg or brew install ffmpeg")?;
     let client = reqwest::Client::new();
     let publisher = check_daemon(&client, &daemon).await?;
 

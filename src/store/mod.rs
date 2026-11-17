@@ -88,8 +88,16 @@ impl BundleStore {
     }
 
     /// Insert a bundle. Returns false if a valid copy is already present
-    /// (dedup by BundleId); an expired copy is overwritten.
+    /// (dedup by BundleId); an expired copy is overwritten. A manifest
+    /// replaces the stored one only when its version is higher. Nothing is
+    /// verified here: this is for the node's own content. Peers use `admit`.
     pub fn insert(&self, bundle: &Bundle) -> Result<bool> {
+        if bundle.info.kind == BundleKind::Manifest {
+            let Some(version) = manifest_version_of(bundle) else {
+                bail!("manifest {} has an unreadable payload", bundle.id());
+            };
+            return self.put_manifest(bundle, version);
+        }
         let id = bundle.id();
         let key = id.as_str().as_bytes();
         let value = encode_bundle(bundle)?;
@@ -155,24 +163,45 @@ impl BundleStore {
         Ok(out)
     }
 
-    /// Metadata of the valid segments of one content ID, ascending by
-    /// sequence. Matches every publisher until the API takes a publisher.
-    pub fn list_meta(&self, content_id: &str) -> Result<Vec<BundleMeta>> {
-        let mut out: Vec<BundleMeta> = self
-            .all_meta()?
-            .into_iter()
-            .filter(|m| m.kind == BundleKind::Segment && m.content_id == content_id)
-            .collect();
+    /// Metadata of the valid segments of one publisher's content, ascending
+    /// by sequence. Reads only that content's keys.
+    pub fn list_meta(&self, publisher: &KeyId, content_id: &str) -> Result<Vec<BundleMeta>> {
+        let now = self.clock.now_ms();
+        // Content IDs hold no `/`, so this prefix matches one content only.
+        let prefix = format!("{publisher}/{content_id}/");
+        let mut out = Vec::new();
+        for item in self.meta.scan_prefix(prefix.as_bytes()) {
+            let (_, value) = item?;
+            let m: BundleMeta = decode(&value)?;
+            if m.kind == BundleKind::Segment && m.is_valid(now) {
+                out.push(m);
+            }
+        }
         out.sort_by_key(|m| m.sequence);
         Ok(out)
     }
 
-    /// List all unique content IDs in the store with their segment counts.
+    /// The stored manifest of a publisher's content, decoded without checking
+    /// its signature. Peer manifests were verified by `admit` and the node's
+    /// own were signed here. None when absent, expired or unreadable.
+    pub fn manifest(&self, publisher: &KeyId, content_id: &str) -> Result<Option<Manifest>> {
+        let id = BundleId::manifest(publisher, content_id);
+        let Some(b) = self.get(id.as_str())? else {
+            return Ok(None);
+        };
+        let manifest = SignedManifest::from_bytes(&b.payload).and_then(|s| decode::<Manifest>(&s.manifest_cbor));
+        Ok(manifest.ok())
+    }
+
+    /// Every publisher and content ID in the store with its segment counts.
+    /// Two publishers that share a content ID get one entry each.
     pub fn catalog(&self) -> Result<Vec<ContentSummary>> {
-        let mut map: HashMap<String, ContentSummary> = HashMap::new();
+        let mut map: HashMap<(KeyId, String), ContentSummary> = HashMap::new();
 
         for m in self.all_meta()?.into_iter().filter(|m| m.kind == BundleKind::Segment) {
-            let entry = map.entry(m.content_id.clone()).or_insert_with(|| ContentSummary {
+            let key = (m.publisher.clone(), m.content_id.clone());
+            let entry = map.entry(key).or_insert_with(|| ContentSummary {
+                publisher: m.publisher.clone(),
                 content_id: m.content_id.clone(),
                 title: m.title.clone(),
                 priority: m.priority,
@@ -184,7 +213,7 @@ impl BundleStore {
         }
 
         let mut items: Vec<_> = map.into_values().collect();
-        items.sort_by(|a, b| a.content_id.cmp(&b.content_id));
+        items.sort_by(|a, b| (&a.content_id, &a.publisher.0).cmp(&(&b.content_id, &b.publisher.0)));
         Ok(items)
     }
 
@@ -276,12 +305,17 @@ fn verify_manifest(b: &Bundle, trust: &dyn KeyLookup) -> Result<Manifest> {
     Ok(m)
 }
 
+/// The version inside a manifest bundle's payload, without checking the
+/// signature. None when it is unreadable.
+fn manifest_version_of(b: &Bundle) -> Option<u64> {
+    let signed = SignedManifest::from_bytes(&b.payload).ok()?;
+    decode::<Manifest>(&signed.manifest_cbor).ok().map(|m| m.version)
+}
+
 /// The version of a manifest already in the store. Stored manifests were
 /// verified on the way in, so this only decodes. None when it is unreadable.
 fn stored_manifest_version(raw: &[u8]) -> Option<u64> {
-    let b = decode_bundle(raw).ok()?;
-    let signed = SignedManifest::from_bytes(&b.payload).ok()?;
-    decode::<Manifest>(&signed.manifest_cbor).ok().map(|m| m.version)
+    manifest_version_of(&decode_bundle(raw).ok()?)
 }
 
 /// Check a segment against a verified manifest of the same publisher and content.
@@ -328,6 +362,18 @@ impl BundleStore {
             Ok(m) => m,
             Err(e) => return Ok(reject(format!("manifest {}: {e}", b.id()))),
         };
+        if !self.put_manifest(b, m.version)? {
+            debug!("Manifest {} version {} is not newer, ignored", b.id(), m.version);
+            return Ok(Admission::Duplicate);
+        }
+        debug!("Stored manifest {} version {}", b.id(), m.version);
+        self.promote_held(&m)?;
+        Ok(Admission::Stored)
+    }
+
+    /// Store a manifest bundle unless a valid stored one has the same or a
+    /// higher version.
+    fn put_manifest(&self, b: &Bundle, version: u64) -> Result<bool> {
         let id = b.id();
         let key = id.as_str().as_bytes();
         let value = encode_bundle(b)?;
@@ -335,7 +381,7 @@ impl BundleStore {
         let meta_value = encode(&b.meta(now))?;
         // The version check sits inside the transaction, so two manifests
         // arriving at once can never leave the older one stored.
-        let replaced = (&*self.db, &self.meta)
+        (&*self.db, &self.meta)
             .transaction(|(db, meta)| -> sled::transaction::ConflictableTransactionResult<bool, ()> {
                 let live = match meta.get(key)? {
                     Some(raw) => decode::<BundleMeta>(&raw).is_ok_and(|m| m.is_valid(now)),
@@ -343,7 +389,7 @@ impl BundleStore {
                 };
                 if live {
                     if let Some(raw) = db.get(key)? {
-                        if stored_manifest_version(&raw).is_some_and(|v| v >= m.version) {
+                        if stored_manifest_version(&raw).is_some_and(|v| v >= version) {
                             return Ok(false);
                         }
                     }
@@ -352,14 +398,7 @@ impl BundleStore {
                 meta.insert(key, meta_value.as_slice())?;
                 Ok(true)
             })
-            .map_err(|e| anyhow::anyhow!("manifest insert transaction: {e:?}"))?;
-        if !replaced {
-            debug!("Manifest {} version {} is not newer, ignored", id, m.version);
-            return Ok(Admission::Duplicate);
-        }
-        debug!("Stored manifest {} version {}", id, m.version);
-        self.promote_held(&m)?;
-        Ok(Admission::Stored)
+            .map_err(|e| anyhow::anyhow!("manifest insert transaction: {e:?}"))
     }
 
     fn admit_segment(&self, b: &Bundle, trust: &dyn KeyLookup) -> Result<Admission> {
@@ -640,7 +679,8 @@ mod tests {
         store.insert(&make_bundle("show_a", 2)).unwrap();
         store.insert(&make_bundle("show_a", 0)).unwrap();
         store.insert(&make_bundle("show_a", 1)).unwrap();
-        let bundles = store.list_meta("show_a").unwrap();
+        store.insert(&make_bundle_by(&KeyId("ffffffffffffffff".into()), "show_a", 5)).unwrap();
+        let bundles = store.list_meta(&publisher(), "show_a").unwrap();
         assert_eq!(bundles.len(), 3);
         assert_eq!(bundles[0].sequence, 0);
         assert_eq!(bundles[1].sequence, 1);
@@ -657,6 +697,28 @@ mod tests {
         assert_eq!(catalog.len(), 2);
         let a = catalog.iter().find(|c| c.content_id == "show_a").unwrap();
         assert_eq!(a.segment_count, 2);
+    }
+
+    #[test]
+    fn list_meta_skips_other_content_and_manifests() {
+        let store = temp_store();
+        store.insert(&make_bundle("show", 0)).unwrap();
+        // "show_b" shares the "show" text prefix but is another content ID.
+        store.insert(&make_bundle("show_b", 1)).unwrap();
+        let ids: Vec<String> = store.list_meta(&publisher(), "show").unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["0123456789abcdef/show/00000".to_string()]);
+    }
+
+    #[test]
+    fn catalog_keeps_publishers_apart() {
+        let store = temp_store();
+        let (p1, p2) = (KeyId("aaaaaaaaaaaaaaaa".into()), KeyId("bbbbbbbbbbbbbbbb".into()));
+        store.insert(&make_bundle_by(&p2, "show", 0)).unwrap();
+        store.insert(&make_bundle_by(&p1, "show", 0)).unwrap();
+        store.insert(&make_bundle_by(&p1, "show", 1)).unwrap();
+        let c = store.catalog().unwrap();
+        let got: Vec<(KeyId, u32)> = c.iter().map(|s| (s.publisher.clone(), s.segment_count)).collect();
+        assert_eq!(got, vec![(p1, 2), (p2, 1)]);
     }
 
     #[test]
@@ -758,7 +820,7 @@ mod tests {
         assert!(store.insert(&fresh).unwrap());
         let got = store.get(fresh.id().as_str()).unwrap().expect("fresh bundle readable");
         assert_eq!(got.age_ms, 0);
-        assert_eq!(store.list_meta("show_a").unwrap().len(), 1);
+        assert_eq!(store.list_meta(&publisher(), "show_a").unwrap().len(), 1);
     }
 
     #[test]
@@ -1022,6 +1084,23 @@ mod tests {
         }
 
         #[test]
+        fn local_insert_replaces_a_manifest_only_when_newer() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            assert!(store.insert(&manifest_bundle(&key, &manifest(&key, 2, 0..3))).unwrap());
+            assert!(!store.insert(&manifest_bundle(&key, &manifest(&key, 1, 0..3))).unwrap());
+            assert!(!store.insert(&manifest_bundle(&key, &manifest(&key, 2, 0..5))).unwrap());
+            assert_eq!(stored_version(&store, &key), 2);
+            assert!(store.insert(&manifest_bundle(&key, &manifest(&key, 3, 0..5))).unwrap());
+            assert_eq!(stored_version(&store, &key), 3);
+            assert_eq!(store.manifest(&key.key_id(), "show").unwrap().unwrap().segments.len(), 5);
+            assert!(store.manifest(&key.key_id(), "other").unwrap().is_none());
+            let junk = Bundle::manifest(&key.key_id(), &manifest(&key, 4, 0..1), b"junk".to_vec(), "node-a");
+            assert!(store.insert(&junk).is_err());
+            assert_eq!(stored_version(&store, &key), 3);
+        }
+
+        #[test]
         fn newer_manifest_replaces_older() {
             let store = temp_store();
             let key = PublisherKey::generate();
@@ -1040,6 +1119,7 @@ mod tests {
 
 #[derive(Debug, serde::Serialize)]
 pub struct ContentSummary {
+    pub publisher: KeyId,
     pub content_id: String,
     pub title: String,
     pub priority: crate::bundle::Priority,

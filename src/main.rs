@@ -280,7 +280,7 @@ async fn serve(
 
     let peers = initial_peers.iter().map(|a| auth::parse_peer(a)).collect::<Result<Vec<_>>>()?;
     let store = Arc::new(BundleStore::open(&store_path)?);
-    let trust = load_trust(&key_dir)?;
+    let (own_key, trust) = load_trust(&key_dir)?;
 
     // 1. Relay auth
     let relay_auth = Arc::new(RelayAuth::new(relay_token));
@@ -353,7 +353,7 @@ async fn serve(
 
     // 8. HTTP API server
     let flush_store = store.clone();
-    let state = ApiState { store, node_id, peers: peer_manager, delay: std::time::Duration::from_secs(delay) };
+    let state = ApiState::new(store, node_id, peer_manager, std::time::Duration::from_secs(delay), own_key);
     let app = api::router(state);
     let addr = format!("{}:{}", bind, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -362,7 +362,9 @@ async fn serve(
     info!("  GET  http://{}/health", addr);
     info!("  GET  http://{}/catalog", addr);
     info!("  GET  http://{}/peers", addr);
+    info!("  GET  http://{}/play/<publisher>/<content_id>", addr);
     info!("  POST http://{}/ingest", addr);
+    info!("  POST http://{}/ingest/finish", addr);
 
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
@@ -373,9 +375,10 @@ async fn serve(
     Ok(())
 }
 
-/// The node's own key, if it has one, plus the keys paired in `key_dir`. A
-/// missing key dir gives a node that trusts nobody.
-fn load_trust(key_dir: &std::path::Path) -> Result<Arc<trust::Trust>> {
+/// The node's own key, if it has one, and a `Trust` of that key plus the keys
+/// paired in `key_dir`. A missing key dir gives a node that trusts nobody and
+/// can not ingest. Pairings are read once, so changes need a restart.
+fn load_trust(key_dir: &std::path::Path) -> Result<(Option<trust::PublisherKey>, Arc<trust::Trust>)> {
     let own = trust::PublisherKey::load_if_present(key_dir)?;
     let paired = trust::PairedKeys::open(key_dir)?;
     match &own {
@@ -383,7 +386,7 @@ fn load_trust(key_dir: &std::path::Path) -> Result<Arc<trust::Trust>> {
         None => info!("Publisher key: none in {}", key_dir.display()),
     }
     info!("Paired keys:   {}", paired.list().len());
-    Ok(Arc::new(trust::Trust::new(own, paired)))
+    Ok((own.clone(), Arc::new(trust::Trust::new(own, paired))))
 }
 
 /// Resolves on Ctrl+C or, on unix, SIGTERM.

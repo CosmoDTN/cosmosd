@@ -41,13 +41,14 @@ pub fn parse_media_playlist(text: &str) -> Vec<PlaylistEntry> {
 
 // === Catalog ===
 
-/// `last_sequence + 1` for `content_id` in a `/catalog` response, else 0.
-pub fn next_sequence(catalog: &serde_json::Value, content_id: &str) -> u32 {
+/// `last_sequence + 1` for this publisher's `content_id` in a `/catalog`
+/// response, else 0. Other publishers may use the same content ID.
+pub fn next_sequence(catalog: &serde_json::Value, publisher: &str, content_id: &str) -> u32 {
     catalog
         .as_array()
         .into_iter()
         .flatten()
-        .find(|c| c["content_id"] == content_id)
+        .find(|c| c["publisher"] == publisher && c["content_id"] == content_id)
         .and_then(|c| c["last_sequence"].as_u64())
         .map_or(0, |s| s as u32 + 1)
 }
@@ -79,11 +80,28 @@ pub(crate) async fn push_segment(
         .send()
         .await
         .with_context(|| format!("Failed to push segment {}", sequence))?;
-    // Keep the daemon's reason (e.g. the 403 for a non-localhost ingest).
+    json_or_reason(resp, &format!("segment {sequence}")).await
+}
+
+/// POST `/ingest/finish`: the daemon signs and stores the manifest listing
+/// every segment of `content_id`. Returns the JSON response.
+pub(crate) async fn finish(client: &reqwest::Client, daemon: &str, content_id: &str) -> Result<serde_json::Value> {
+    let resp = client
+        .post(format!("{}/ingest/finish", daemon))
+        .json(&serde_json::json!({ "content_id": content_id }))
+        .send()
+        .await
+        .with_context(|| format!("Failed to finish {}", content_id))?;
+    json_or_reason(resp, &format!("finish of {content_id}")).await
+}
+
+/// The JSON body of a success, else an error carrying the daemon's reason
+/// (e.g. the 403 for a non-localhost ingest or the 409 for a missing key).
+async fn json_or_reason(resp: reqwest::Response, what: &str) -> Result<serde_json::Value> {
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Daemon rejected segment {}: {}: {}", sequence, status, body.trim());
+        anyhow::bail!("Daemon rejected {}: {}: {}", what, status, body.trim());
     }
     Ok(resp.json().await?)
 }
@@ -99,13 +117,20 @@ pub(crate) fn which_ffmpeg() -> Option<()> {
         .map(|_| ())
 }
 
-pub(crate) async fn check_daemon(client: &reqwest::Client, daemon: &str) -> Result<()> {
-    client
+/// Check the daemon is up and has a publisher key. Returns its key ID.
+pub(crate) async fn check_daemon(client: &reqwest::Client, daemon: &str) -> Result<String> {
+    let health: serde_json::Value = client
         .get(format!("{}/health", daemon))
         .send()
         .await
-        .context("Cannot reach cosmosd — is it running? cosmosd serve")?;
-    Ok(())
+        .context("Cannot reach cosmosd — is it running? cosmosd serve")?
+        .json()
+        .await
+        .context("Bad /health response")?;
+    health["publisher"]
+        .as_str()
+        .map(str::to_string)
+        .context("The daemon has no publisher key: run cosmosd keys init first, then restart cosmosd serve")
 }
 
 // === File ingest ===
@@ -137,14 +162,15 @@ pub async fn ingest_file(
     // 1. Check ffmpeg is available
     which_ffmpeg().context("ffmpeg not found — install it: apt install ffmpeg / brew install ffmpeg")?;
 
-    // 2. Check daemon is reachable
+    // 2. Check daemon is reachable and can sign
     let client = reqwest::Client::new();
-    check_daemon(&client, &daemon).await?;
+    let publisher = check_daemon(&client, &daemon).await?;
 
     info!("Ingesting: {}", title);
     info!("File:      {}", file.display());
     info!("Content ID:{}", content_id);
     info!("Daemon:    {}", daemon);
+    info!("Publisher: {}", publisher);
 
     // 3. Chunk into HLS segments with ffmpeg
     let tmp = tempfile::tempdir()?;
@@ -184,8 +210,12 @@ pub async fn ingest_file(
         info!("  seg{:05} → {} (stored={})", i, data["bundle_id"], data["stored"]);
     }
 
+    // 5. Publish the signed manifest, so peers accept the segments
+    let data = finish(&client, &daemon, &content_id).await?;
+    info!("Manifest {} version {}", data["manifest_id"], data["version"]);
+
     info!("Done: {} ({} segments)", title, entries.len());
-    info!("Play: ffplay {}/play/{}", daemon, content_id);
+    info!("Play: ffplay {}/play/{}/{}", daemon, publisher, content_id);
     Ok(())
 }
 
@@ -219,8 +249,49 @@ mod tests {
 
     #[test]
     fn next_sequence_continues_after_catalog() {
-        let c = serde_json::json!([{"content_id": "m", "last_sequence": 41}, {"content_id": "x", "last_sequence": 3}]);
-        assert_eq!(next_sequence(&c, "m"), 42);
-        assert_eq!(next_sequence(&c, "new"), 0);
+        let c = serde_json::json!([
+            {"publisher": "p", "content_id": "m", "last_sequence": 41},
+            {"publisher": "p", "content_id": "x", "last_sequence": 3},
+        ]);
+        assert_eq!(next_sequence(&c, "p", "m"), 42);
+        assert_eq!(next_sequence(&c, "p", "new"), 0);
+    }
+
+    #[test]
+    fn next_sequence_ignores_other_publishers() {
+        let c = serde_json::json!([
+            {"publisher": "other", "content_id": "m", "last_sequence": 900},
+            {"publisher": "mine", "content_id": "m", "last_sequence": 4},
+        ]);
+        assert_eq!(next_sequence(&c, "mine", "m"), 5);
+        assert_eq!(next_sequence(&c, "nobody", "m"), 0);
+    }
+
+    #[tokio::test]
+    async fn finish_posts_the_content_id() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/ingest/finish",
+            post(|Json(body): Json<serde_json::Value>| async move { Json(serde_json::json!({ "got": body })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daemon = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let data = finish(&reqwest::Client::new(), &daemon, "show").await.unwrap();
+        assert_eq!(data["got"], serde_json::json!({ "content_id": "show" }));
+    }
+
+    #[tokio::test]
+    async fn finish_error_carries_the_daemon_body() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let app = Router::new().route("/ingest/finish", post(|| async { (StatusCode::CONFLICT, "run cosmosd keys init first") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daemon = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let err = finish(&reqwest::Client::new(), &daemon, "show").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("409") && msg.contains("run cosmosd keys init first"), "{msg}");
     }
 }

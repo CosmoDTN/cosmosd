@@ -3,6 +3,8 @@
 //! Live playlists sit `--delay` behind the newest segment: only segments at
 //! least `delay` old are listed, so everything between that edge and the newest
 //! segment is buffer that rides out link drops. A playlist never has a hole.
+//! The live edge uses each segment's `created_at_ms` from its content info.
+//! Segment URLs name the publisher, so a player never needs the short form.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -18,9 +20,9 @@ pub const LIVE_WINDOW: usize = 6;
 
 /// Live playlist for the window ending at the wall-clock edge `now - delay`.
 ///
-/// `metas` is ascending by sequence. Returns `None` if nothing is old enough.
+/// `metas` is one content's segments, ascending by sequence. Returns `None`
+/// if nothing is old enough.
 pub fn live_playlist(
-    content_id: &str,
     metas: &[BundleMeta],
     now: DateTime<Utc>,
     delay: Duration,
@@ -42,16 +44,16 @@ pub fn live_playlist(
         .iter()
         .filter(|m| (first..=last).contains(&m.sequence))
         .collect();
-    Some(render(content_id, &run, false))
+    Some(render(&run, false))
 }
 
 /// Playlist of every segment, closed with `EXT-X-ENDLIST`.
-pub fn vod_playlist(content_id: &str, metas: &[BundleMeta]) -> String {
+pub fn vod_playlist(metas: &[BundleMeta]) -> String {
     let all: Vec<&BundleMeta> = metas.iter().collect();
-    render(content_id, &all, true)
+    render(&all, true)
 }
 
-fn render(content_id: &str, segs: &[&BundleMeta], endlist: bool) -> String {
+fn render(segs: &[&BundleMeta], endlist: bool) -> String {
     let max_ms = segs.iter().map(|m| m.duration_ms).max().unwrap_or(0);
     let first = segs.first().map_or(0, |m| m.sequence);
     let mut out = format!(
@@ -61,9 +63,10 @@ fn render(content_id: &str, segs: &[&BundleMeta], endlist: bool) -> String {
     );
     for m in segs {
         out.push_str(&format!(
-            "#EXTINF:{:.3},\n/segment/{}/{}\n",
+            "#EXTINF:{:.3},\n/segment/{}/{}/{}\n",
             m.duration_ms as f64 / 1000.0,
-            content_id,
+            m.publisher,
+            m.content_id,
             m.sequence
         ));
     }
@@ -103,10 +106,10 @@ mod tests {
     fn live_edge_is_now_minus_delay() {
         let now = Utc::now();
         let m = metas(20, now); // seq 7 created at now-120s
-        let p = live_playlist("m", &m, now, Duration::from_secs(120)).unwrap();
+        let p = live_playlist(&m, now, Duration::from_secs(120)).unwrap();
         assert!(p.contains("#EXT-X-MEDIA-SEQUENCE:2\n"));
-        assert!(p.contains("/segment/m/7\n"));
-        assert!(!p.contains("/segment/m/8\n"));
+        assert!(p.contains("/segment/p/m/7\n"));
+        assert!(!p.contains("/segment/p/m/8\n"));
         assert!(!p.contains("ENDLIST"));
     }
 
@@ -114,15 +117,15 @@ mod tests {
     fn hole_at_edge_shortens_the_run() {
         let now = Utc::now();
         let m: Vec<_> = metas(20, now).into_iter().filter(|x| x.sequence != 5).collect();
-        let p = live_playlist("m", &m, now, Duration::from_secs(120)).unwrap();
+        let p = live_playlist(&m, now, Duration::from_secs(120)).unwrap();
         assert!(p.contains("#EXT-X-MEDIA-SEQUENCE:6\n"));
-        assert!(!p.contains("/segment/m/4\n"));
+        assert!(!p.contains("/segment/p/m/4\n"));
     }
 
     #[test]
     fn nothing_old_enough_is_none() {
         let now = Utc::now();
-        assert!(live_playlist("m", &metas(5, now), now, Duration::from_secs(120)).is_none());
+        assert!(live_playlist(&metas(5, now), now, Duration::from_secs(120)).is_none());
     }
 
     #[test]
@@ -132,7 +135,7 @@ mod tests {
         for x in &mut m {
             x.duration_ms = 10_010;
         }
-        let p = live_playlist("m", &m, now, Duration::from_secs(120)).unwrap();
+        let p = live_playlist(&m, now, Duration::from_secs(120)).unwrap();
         assert!(p.contains("#EXT-X-TARGETDURATION:11\n"));
         assert!(p.contains("#EXTINF:10.010,\n"));
     }
@@ -140,9 +143,9 @@ mod tests {
     #[test]
     fn vod_lists_everything_and_ends() {
         let now = Utc::now();
-        let p = vod_playlist("f", &metas(3, now));
+        let p = vod_playlist(&metas(3, now));
         assert!(p.contains("#EXT-X-MEDIA-SEQUENCE:0\n"));
-        assert!(p.contains("/segment/f/2\n"));
+        assert!(p.contains("/segment/p/m/2\n"));
         assert!(p.ends_with("#EXT-X-ENDLIST\n"));
     }
 }

@@ -1,5 +1,6 @@
 //! Live ingest — transcode a live stream to capped H.264/AAC HLS and push
-//! each finished segment to the daemon as a `live` bundle.
+//! each finished segment to the daemon as a `live` bundle. The daemon signs
+//! each one and publishes the next version of the live manifest.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -59,7 +60,7 @@ pub async fn ingest_live(
 ) -> Result<()> {
     which_ffmpeg().context("ffmpeg not found — install it: apt install ffmpeg / brew install ffmpeg")?;
     let client = reqwest::Client::new();
-    check_daemon(&client, &daemon).await?;
+    let publisher = check_daemon(&client, &daemon).await?;
 
     let catalog: serde_json::Value = client
         .get(format!("{}/catalog", daemon))
@@ -68,11 +69,12 @@ pub async fn ingest_live(
         .json()
         .await
         .context("Bad /catalog response")?;
-    let mut sequence = next_sequence(&catalog, &content_id);
+    let mut sequence = next_sequence(&catalog, &publisher, &content_id);
 
     info!("Live ingest: {} ({})", title, content_id);
     info!("Input:      {}", input);
     info!("Daemon:     {}", daemon);
+    info!("Publisher:  {}", publisher);
     info!("Max rate:   {} kbps, first sequence {}", max_kbps, sequence);
 
     // Dropping `run` on either signal kills ffmpeg (kill_on_drop) and

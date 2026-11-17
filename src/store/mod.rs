@@ -10,6 +10,7 @@
 //! BLAKE3 hash. A segment that arrives before its manifest waits in the
 //! `pending` tree for [`HOLD_SECS`] and is never listed or offered to peers.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sled::Transactional;
 use tracing::{debug, info, warn};
 
-use crate::bundle::{check_content_id, Bundle, BundleId, BundleKind, BundleMeta};
+use crate::bundle::{check_content_id, Bundle, BundleId, BundleKind, BundleMeta, Priority};
 use crate::codec::{decode, encode};
 use crate::trust::manifest::{Manifest, SignedManifest};
 use crate::trust::{KeyId, KeyLookup};
@@ -350,7 +351,17 @@ fn stored_manifest_version(raw: &[u8]) -> Option<u64> {
     manifest_version_of(&decode_bundle(raw).ok()?)
 }
 
-/// Check a segment against a verified manifest of the same publisher and content.
+/// Check that a bundle's priority fits a verified manifest: live exactly
+/// when the manifest is live.
+fn check_priority(b: &Bundle, m: &Manifest) -> Result<(), String> {
+    if (b.info.priority == Priority::Live) != m.live {
+        return Err(format!("{} has priority {:?} but its manifest has live: {}", b.id(), b.info.priority, m.live));
+    }
+    Ok(())
+}
+
+/// Check a segment against a verified manifest of the same publisher and
+/// content: payload, sequence, duration and priority.
 fn check_segment(b: &Bundle, m: &Manifest) -> Result<(), String> {
     if b.publisher != m.publisher || b.info.content_id != m.content_id {
         return Err(format!("segment {} does not belong to this manifest", b.id()));
@@ -361,7 +372,21 @@ fn check_segment(b: &Bundle, m: &Manifest) -> Result<(), String> {
     if blake3::hash(&b.payload).as_bytes() != &entry.hash {
         return Err(format!("payload of {} does not match the manifest hash", b.id()));
     }
-    Ok(())
+    if b.info.duration_ms != entry.duration_ms {
+        return Err(format!("{} lasts {} ms but its manifest says {} ms", b.id(), b.info.duration_ms, entry.duration_ms));
+    }
+    check_priority(b, m)
+}
+
+/// The segment as it is stored: the title comes from the signed manifest,
+/// not the bundle. Copies the bundle only when the titles differ.
+fn with_manifest_title<'a>(b: &'a Bundle, m: &Manifest) -> Cow<'a, Bundle> {
+    if b.info.title == m.title {
+        return Cow::Borrowed(b);
+    }
+    let mut b = b.clone();
+    b.info.title = m.title.clone();
+    Cow::Owned(b)
 }
 
 impl BundleStore {
@@ -370,11 +395,21 @@ impl BundleStore {
     /// The publisher must be in `trust`. A manifest must carry a valid
     /// signature and is stored only when it is newer than the stored one. A
     /// segment is stored only when the stored manifest lists its sequence with
-    /// the BLAKE3 hash of its payload. A segment with no manifest yet is held.
+    /// the BLAKE3 hash of its payload and its duration. A segment with no
+    /// manifest yet is held.
+    ///
+    /// Block 192 and the lifetime are not signed, so they are pinned: the
+    /// priority is `Live` exactly when the manifest is live, the lifetime is
+    /// the one the priority sets, and a stored segment takes its title from
+    /// the manifest. The age and the creation time stay unsigned.
     /// Hostile input gives `Rejected`, and only storage failures are errors.
     pub fn admit(&self, b: &Bundle, trust: &dyn KeyLookup) -> Result<Admission> {
         if !b.valid_on_arrival() {
             return Ok(reject(format!("{} expired before it arrived", b.id())));
+        }
+        // The lifetime is not signed, so only the one its priority sets is accepted.
+        if b.lifetime_ms != b.info.priority.lifetime_ms() {
+            return Ok(reject(format!("{} has lifetime {} ms, not the {:?} lifetime", b.id(), b.lifetime_ms, b.info.priority)));
         }
         // Held segments are found by a `<publisher>/<content_id>/` prefix.
         if let Err(e) = check_content_id(&b.info.content_id) {
@@ -394,6 +429,9 @@ impl BundleStore {
             Ok(m) => m,
             Err(e) => return Ok(reject(format!("manifest {}: {e}", b.id()))),
         };
+        if let Err(reason) = check_priority(b, &m) {
+            return Ok(reject(reason));
+        }
         if !self.put_manifest(b, m.version)? {
             debug!("Manifest {} version {} is not newer, ignored", b.id(), m.version);
             return Ok(Admission::Duplicate);
@@ -440,7 +478,7 @@ impl BundleStore {
         if let Err(reason) = check_segment(b, &m) {
             return Ok(reject(reason));
         }
-        Ok(if self.insert(b)? { Admission::Stored } else { Admission::Duplicate })
+        Ok(if self.insert(&with_manifest_title(b, &m))? { Admission::Stored } else { Admission::Duplicate })
     }
 
     /// The stored manifest for a publisher's content, verified again against
@@ -531,7 +569,7 @@ impl BundleStore {
         if let Err(reason) = check_segment(&b, m) {
             return Ok(reject(reason));
         }
-        Ok(if self.insert(&b)? { Admission::Stored } else { Admission::Duplicate })
+        Ok(if self.insert(&with_manifest_title(&b, m))? { Admission::Stored } else { Admission::Duplicate })
     }
 }
 
@@ -1130,6 +1168,91 @@ mod tests {
             let junk = Bundle::manifest(&key.key_id(), &manifest(&key, 4, 0..1), b"junk".to_vec(), "node-a");
             assert!(store.insert(&junk).is_err());
             assert_eq!(stored_version(&store, &key), 3);
+        }
+
+        fn live_manifest(key: &PublisherKey, version: u64, seqs: impl IntoIterator<Item = u32>) -> Manifest {
+            Manifest { live: true, ..manifest(key, version, seqs) }
+        }
+
+        fn segment_with(key: &PublisherKey, seq: u32, priority: Priority) -> Bundle {
+            Bundle::segment(&key.key_id(), "show", "Show", seq, "video/mp2t", priority, payload(seq), "node-a").unwrap()
+        }
+
+        fn rejected(a: Admission) -> bool {
+            matches!(a, Admission::Rejected(_))
+        }
+
+        #[test]
+        fn unsigned_segment_fields_must_match_the_manifest() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            assert_eq!(store.admit(&manifest_bundle(&key, &manifest(&key, 1, 0..6)), &keys).unwrap(), Admission::Stored);
+
+            let wrong_duration = segment(&key, 0, payload(0)).with_duration_ms(9_000);
+            assert!(rejected(store.admit(&wrong_duration, &keys).unwrap()), "duration");
+            // A VOD manifest: a segment that claims to be live is refused.
+            assert!(rejected(store.admit(&segment_with(&key, 1, Priority::Live), &keys).unwrap()), "priority");
+            let mut long_life = segment(&key, 2, payload(2));
+            long_life.lifetime_ms += 1;
+            assert!(rejected(store.admit(&long_life, &keys).unwrap()), "lifetime");
+            for s in 0..3 {
+                assert!(!is_stored(&store, &segment(&key, s, payload(s))), "seq {s} stored");
+            }
+
+            // The title is taken from the manifest, whatever the bundle says.
+            let mut retitled = segment(&key, 3, payload(3));
+            retitled.info.title = "Something else".into();
+            assert_eq!(store.admit(&retitled, &keys).unwrap(), Admission::Stored);
+            assert_eq!(store.get(retitled.id().as_str()).unwrap().unwrap().info.title, "Show");
+            assert_eq!(store.catalog().unwrap()[0].title, "Show");
+
+            // Honest segments, VOD or near-live, are still admitted.
+            assert_eq!(store.admit(&segment(&key, 4, payload(4)), &keys).unwrap(), Admission::Stored);
+            assert_eq!(store.admit(&segment_with(&key, 5, Priority::NearLive), &keys).unwrap(), Admission::Stored);
+        }
+
+        #[test]
+        fn held_segment_fields_are_checked_on_promotion() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let mut retitled = segment(&key, 0, payload(0));
+            retitled.info.title = "Something else".into();
+            let wrong_duration = segment(&key, 1, payload(1)).with_duration_ms(9_000);
+            assert_eq!(store.admit(&retitled, &keys).unwrap(), Admission::Held);
+            assert_eq!(store.admit(&wrong_duration, &keys).unwrap(), Admission::Held);
+            assert_eq!(store.admit(&manifest_bundle(&key, &manifest(&key, 1, 0..2)), &keys).unwrap(), Admission::Stored);
+            assert_eq!(store.get(retitled.id().as_str()).unwrap().unwrap().info.title, "Show");
+            assert!(!is_stored(&store, &wrong_duration));
+        }
+
+        #[test]
+        fn live_manifest_admits_only_live_segments() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            assert_eq!(store.admit(&manifest_bundle(&key, &live_manifest(&key, 1, 0..3)), &keys).unwrap(), Admission::Stored);
+            assert!(rejected(store.admit(&segment_with(&key, 0, Priority::Vod), &keys).unwrap()));
+            assert!(rejected(store.admit(&segment_with(&key, 1, Priority::NearLive), &keys).unwrap()));
+            assert_eq!(store.admit(&segment_with(&key, 2, Priority::Live), &keys).unwrap(), Admission::Stored);
+        }
+
+        #[test]
+        fn manifest_bundle_priority_and_lifetime_must_fit_the_manifest() {
+            let store = temp_store();
+            let key = PublisherKey::generate();
+            let keys = Keys(vec![key.clone()]);
+            let mut as_vod = manifest_bundle(&key, &live_manifest(&key, 1, 0..3));
+            as_vod.info.priority = Priority::Vod;
+            as_vod.lifetime_ms = Priority::Vod.lifetime_ms();
+            assert!(rejected(store.admit(&as_vod, &keys).unwrap()), "live manifest carried as VOD");
+            let mut long_life = manifest_bundle(&key, &live_manifest(&key, 1, 0..3));
+            long_life.lifetime_ms = Priority::Vod.lifetime_ms();
+            assert!(rejected(store.admit(&long_life, &keys).unwrap()), "live manifest with the VOD lifetime");
+            assert!(store.all_ids().unwrap().is_empty());
+            let honest = manifest_bundle(&key, &live_manifest(&key, 1, 0..3));
+            assert_eq!(store.admit(&honest, &keys).unwrap(), Admission::Stored);
         }
 
         #[test]

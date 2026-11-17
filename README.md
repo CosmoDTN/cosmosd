@@ -197,10 +197,16 @@ A node stores a bundle from a peer only when it checks out:
 - The publisher is the node's own key or a paired key.
 - A manifest carries a valid signature. It replaces the stored one only when
   its version is higher.
-- A segment matches the hash its manifest lists. A segment that arrives before
-  its manifest waits up to 10 minutes for it.
+- A segment matches the hash, sequence and duration its manifest lists. A
+  segment that arrives before its manifest waits up to 10 minutes for it.
+- The priority is `live` exactly when the manifest is live. The lifetime is
+  the one the priority sets. A stored segment takes its title from the
+  manifest.
 
-Everything else is dropped. A node never passes on content it could not check.
+Everything else is dropped. So the payload bytes, sequence and duration of a
+segment are checked against a signed manifest. The age and the creation time
+are not signed. A carrier can change them, which moves when a bundle expires
+or where the live edge sits, but not the video itself.
 
 `serve` reads the keys once, at startup. After `keys pair` or `keys unpair`,
 restart a running node. Until the restart it keeps its old trust. So a new

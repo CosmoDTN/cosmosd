@@ -81,8 +81,10 @@ node does that before it stores anything.
 - **Signed content.** Every content item has a publisher with an Ed25519 key.
   The publisher signs a manifest that lists the BLAKE3 hash of each segment.
   A node stores a manifest only when its signature checks out, and a segment
-  only when its hash matches the manifest. A corrupted or forged bundle is
-  dropped on arrival, so a lossy medium can never plant bad content.
+  only when its hash, sequence and duration match the manifest. A corrupted
+  or forged segment is dropped on arrival. The age and the creation time are
+  not signed, so a carrier can change when a bundle expires or where the live
+  edge sits, but not the video itself.
 - **Pairing.** A node accepts content only from its own key and the keys it
   has paired with `cosmosd keys pair`. Pairing is done by people, out of band.
   It is never negotiated over a transport. `serve` reads the keys at startup,

@@ -64,20 +64,14 @@ impl PublisherKey {
         fs::create_dir_all(dir)?;
         let path = dir.join(KEY_FILE);
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = opts.open(&path).with_context(|| format!("writing {}", path.display()))?;
+        let mut file = opts.open(&path).with_context(|| format!("creating {} (it must not already exist)", path.display()))?;
         file.write_all(&self.signing.to_bytes())?;
-        // `mode` above only applies to a new file, so fix up an existing one.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
         Ok(())
     }
 
@@ -169,7 +163,10 @@ impl PairedKeys {
             fs::create_dir_all(dir)?;
         }
         let text: String = self.keys.iter().map(|k| format!("{}\n", pairing_string(k))).collect();
-        fs::write(&self.path, text).with_context(|| format!("writing {}", self.path.display()))
+        // Write a sibling temp file then rename, so a crash never leaves a truncated store.
+        let tmp = self.path.with_extension("keys.tmp");
+        fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, &self.path).with_context(|| format!("replacing {}", self.path.display()))
     }
 }
 
@@ -281,6 +278,27 @@ mod tests {
         let k = PublisherKey::generate();
         k.save(dir.path()).unwrap();
         assert_eq!(PublisherKey::load(dir.path()).unwrap().public(), k.public());
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_existing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = PublisherKey::generate();
+        first.save(dir.path()).unwrap();
+        assert!(PublisherKey::generate().save(dir.path()).is_err());
+        assert_eq!(PublisherKey::load(dir.path()).unwrap().public(), first.public());
+    }
+
+    #[test]
+    fn persist_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = PublisherKey::generate();
+        let mut paired = PairedKeys::open(dir.path()).unwrap();
+        let id = paired.pair(k.public()).unwrap();
+        paired.unpair(&id).unwrap();
+        paired.pair(k.public()).unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(PAIRED_FILE)]);
     }
 
     #[cfg(unix)]

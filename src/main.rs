@@ -31,7 +31,7 @@ mod trust;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -211,11 +211,9 @@ fn keys_command(key_dir: Option<PathBuf>, action: KeysCmd) -> Result<()> {
     };
     match action {
         KeysCmd::Init => {
-            if dir.join("publisher.key").exists() {
-                anyhow::bail!("a publisher key already exists in {}", dir.display());
-            }
             let key = PublisherKey::generate();
-            key.save(&dir)?;
+            // save refuses to overwrite, so an existing key is never clobbered.
+            key.save(&dir).with_context(|| format!("a publisher key may already exist in {}", dir.display()))?;
             println!("created publisher key {}", key.key_id());
         }
         KeysCmd::Show => {

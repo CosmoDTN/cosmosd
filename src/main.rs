@@ -10,6 +10,9 @@
 //!   cosmosd ingest /path/to/movie.mkv                # Ingest a local file
 //!   cosmosd ingest /path/to/movie.mkv --title "Dune" # With custom title
 //!   cosmosd ingest --live udp://127.0.0.1:5000 --content-id demo  # Live stream
+//!   cosmosd keys init                                # Create a publisher key
+//!   cosmosd keys show                                # Print pairing string and key ID
+//!   cosmosd keys pair cosmos-key:...                 # Trust a publisher
 
 mod api;
 mod auth;
@@ -22,6 +25,8 @@ mod peer;
 mod router;
 mod store;
 mod transport;
+// Trust and KeyLookup are used by the bundle verifier from Task 2 onward.
+mod trust;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -135,6 +140,30 @@ enum Command {
         #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u32).range(400..))]
         max_bitrate: u32,
     },
+
+    /// Manage publisher keys and the keys this node trusts.
+    Keys {
+        /// Key directory (default $HOME/.config/cosmosd).
+        #[arg(long, global = true)]
+        key_dir: Option<PathBuf>,
+
+        #[command(subcommand)]
+        action: KeysCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Create this node's publisher key.
+    Init,
+    /// Print this node's pairing string and key ID.
+    Show,
+    /// Trust a publisher, given its pairing string.
+    Pair { pairing: String },
+    /// Stop trusting a publisher, given its key ID.
+    Unpair { key_id: String },
+    /// List the paired key IDs.
+    List,
 }
 
 // === Entry point ===
@@ -162,8 +191,55 @@ async fn main() -> Result<()> {
                 (None, None) => unreachable!("clap requires FILE or --live"),
             }
         }
+        Command::Keys { key_dir, action } => keys_command(key_dir, action)?,
     }
 
+    Ok(())
+}
+
+fn default_key_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set, pass --key-dir"))?;
+    Ok(PathBuf::from(home).join(".config/cosmosd"))
+}
+
+fn keys_command(key_dir: Option<PathBuf>, action: KeysCmd) -> Result<()> {
+    use trust::{pairing_string, parse_pairing_string, KeyId, PairedKeys, PublisherKey};
+
+    let dir = match key_dir {
+        Some(d) => d,
+        None => default_key_dir()?,
+    };
+    match action {
+        KeysCmd::Init => {
+            if dir.join("publisher.key").exists() {
+                anyhow::bail!("a publisher key already exists in {}", dir.display());
+            }
+            let key = PublisherKey::generate();
+            key.save(&dir)?;
+            println!("created publisher key {}", key.key_id());
+        }
+        KeysCmd::Show => {
+            let key = PublisherKey::load(&dir)?;
+            println!("{}", pairing_string(&key.public()));
+            println!("key id: {}", key.key_id());
+        }
+        KeysCmd::Pair { pairing } => {
+            let id = PairedKeys::open(&dir)?.pair(parse_pairing_string(&pairing)?)?;
+            println!("paired {id}");
+        }
+        KeysCmd::Unpair { key_id } => {
+            if PairedKeys::open(&dir)?.unpair(&KeyId(key_id.clone()))? {
+                println!("unpaired {key_id}");
+            } else {
+                anyhow::bail!("no paired key {key_id}");
+            }
+        }
+        KeysCmd::List => {
+            for id in PairedKeys::open(&dir)?.list() {
+                println!("{id}");
+            }
+        }
+    }
     Ok(())
 }
 

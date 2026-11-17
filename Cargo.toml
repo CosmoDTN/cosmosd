@@ -51,6 +51,9 @@ tempfile = "3"
 ciborium = "0.2"
 serde_bytes = "0.11"
 if-addrs = "0.13"
+ed25519-dalek = "3.0.0"
+getrandom = "0.4.3"
+data-encoding = "2.11.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

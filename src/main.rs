@@ -18,7 +18,6 @@
 mod api;
 mod auth;
 mod bundle;
-// Used by the store, router and API from Tasks 2/4 onward.
 mod codec;
 mod discovery;
 mod ingest;
@@ -387,8 +386,8 @@ async fn serve(
     .with_incoming_registration(!no_discovery));
 
     // 4. Background: reap expired bundles and flush the expiry clock every
-    //    5 minutes. There is no clean shutdown path yet, so the flush here
-    //    bounds the time lost on exit.
+    //    5 minutes. A clean stop flushes too. This flush bounds the held
+    //    time an unclean stop can lose.
     {
         let store = store.clone();
         tokio::spawn(async move {

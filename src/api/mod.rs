@@ -547,6 +547,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_ingest_finish_from_lan_is_forbidden() {
+        let (state, _dir) = test_state_with_key(Some(PublisherKey::generate()));
+        let app = router(state).layer(from_ip([192, 168, 1, 9]));
+        let res = app.oneshot(post_json("/ingest/finish", r#"{"content_id":"show"}"#)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn post_peers_from_localhost_is_allowed() {
         let (state, _dir) = test_state();
         let app = router(state).layer(from_ip([127, 0, 0, 1]));

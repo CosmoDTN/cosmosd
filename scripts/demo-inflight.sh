@@ -110,7 +110,7 @@ PIDS+=($!)
 
 for node in ground gateway cabin; do mkdir -p "$DIR/keys/$node"; done
 "$COSMOSD" keys --key-dir "$DIR/keys/ground" init
-PAIRING="$("$COSMOSD" keys --key-dir "$DIR/keys/ground" show | head -n 1)"
+PAIRING="$("$COSMOSD" keys --key-dir "$DIR/keys/ground" show | sed -n 1p)"
 for node in gateway cabin; do
     "$COSMOSD" keys --key-dir "$DIR/keys/$node" pair "$PAIRING"
 done

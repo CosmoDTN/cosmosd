@@ -8,8 +8,9 @@
 # µD3TN gets a contact to the bundle's destination node that opens a few
 # seconds in the future, so it must store the bundle before it forwards it.
 # The receiver is a small MTCP listener in this script. The forwarded bytes
-# must decode with cosmosd's own decoder, which needs block 192 intact, and
-# must keep the publisher, content ID, kind, sequence and payload hash.
+# must decode with cosmosd's own decoder, which needs a valid block 192, and
+# must keep the publisher, content ID, kind, sequence and payload hash. The
+# age must grow by the hold time and the hop count must rise.
 #
 # µD3TN has no TCPCLv4, so the convergence layer is MTCP. µD3TN is cloned at
 # a pinned release into a fresh temp dir, built with its documented
@@ -215,8 +216,10 @@ wait_for 10 grep -q "CLA mtcp is now listening" "$RUN/ud3tn.log" \
 wait_for 10 test -S "$RUN/aap.sock" || fail_with_log "µD3TN did not open its AAP socket"
 say "µD3TN $UD3TN_VERSION is up as $NODE_ID, MTCP in on 127.0.0.1:$IN_PORT"
 
-# The receiver stands in for the next node. It takes one bundle.
-helper recv "$OUT_PORT" "$RUN/out.bundle" "$RUN/recv.ready" 30 2>"$RUN/recv.err" &
+# The receiver stands in for the next node. It takes one bundle. It is
+# started here, not through the helper function, so that $! is the python
+# process itself and cleanup kills it.
+(cd "$RUN" && exec python3 -I -c "$HELPER" recv "$OUT_PORT" "$RUN/out.bundle" "$RUN/recv.ready" 30 2>"$RUN/recv.err") &
 PIDS+=($!)
 wait_for 10 test -f "$RUN/recv.ready" || fail "MTCP receiver did not start"
 
@@ -238,7 +241,8 @@ wait_for 10 grep -q "Received new bundle .* to \"$DEST\"" "$RUN/ud3tn.log" \
 say "µD3TN log: $(grep -o "Received new bundle .* to \"$DEST\" via CLA mtcp" "$RUN/ud3tn.log" | head -n 1)"
 
 wait_for 30 test -f "$RUN/out.bundle" || fail_with_log "µD3TN did not forward the bundle"
-grep -q "TX of bundle .* to \"dtn://$PUBLISHER/\" via \"mtcp:127.0.0.1:$OUT_PORT\" OK" "$RUN/ud3tn.log" \
+# The receiver can have the bytes before µD3TN logs the forward, so wait.
+wait_for 5 grep -q "TX of bundle .* to \"dtn://$PUBLISHER/\" via \"mtcp:127.0.0.1:$OUT_PORT\" OK" "$RUN/ud3tn.log" \
     || fail_with_log "µD3TN did not report a successful forward"
 say "µD3TN log: $(grep -o "TX of bundle .* OK" "$RUN/ud3tn.log" | head -n 1)"
 say "receiver got $(wc -c <"$RUN/out.bundle" | tr -d ' ') bytes back"
@@ -255,7 +259,11 @@ age_in="$(sed -n 's/^age_ms=//p' "$RUN/in.txt")"
 age_out="$(sed -n 's/^age_ms=//p' "$RUN/out.txt")"
 [ "$age_out" -ge $((age_in + 1000)) ] \
     || fail "bundle age went from $age_in ms to $age_out ms, so µD3TN did not hold it for the contact"
+# A forwarding node raises the hop count.
+hops_in="$(sed -n 's/^hop_count=//p' "$RUN/in.txt")"
+hops_out="$(sed -n 's/^hop_count=//p' "$RUN/out.txt")"
+[ "$hops_out" -gt "$hops_in" ] || fail "hop count went from $hops_in to $hops_out, expected it to rise"
 say "decoded by cosmosd, before -> after:"
 paste -d' ' <(sed 's/^/  /' "$RUN/in.txt") <(sed 's/^[^=]*=/-> /' "$RUN/out.txt")
 
-echo "INTEROP PASS: µD3TN $UD3TN_VERSION received, stored and forwarded a cosmosd bundle with block 192 intact"
+echo "INTEROP PASS: µD3TN $UD3TN_VERSION received, stored and forwarded a cosmosd bundle, and block 192 still decodes"

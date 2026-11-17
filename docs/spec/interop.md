@@ -32,6 +32,7 @@ The plan said to run µD3TN in Docker. No Docker daemon runs on the development 
    - The receiver gets the bundle and `cosmosd dev-bundle --check` decodes it. That decoder refuses a bundle without a valid block 192.
    - Publisher, content ID, kind, sequence and payload hash are unchanged.
    - The age block grew by at least 1000 ms. This shows µD3TN held the bundle until the contact opened.
+   - The hop count rose.
 8. Kill µD3TN and the receiver. Remove every temp dir.
 
 The script prints `INTEROP PASS` and exits 0 only when every check holds. Otherwise it prints `INTEROP FAIL:` with a reason and exits 1.
@@ -47,41 +48,44 @@ scripts/interop-ud3tn.sh
 The run on 2026-11-17 printed this.
 
 ```
-interop: sample bundle: 291 bytes to dtn://8ac027f3a4daf768/interop-sample
-interop: µD3TN v0.15.2 (commit 6b18b267ce79ac0c8d8f7dbce5389f2acef0ca40) is up as dtn://interop-node/, MTCP in on 127.0.0.1:64741
-interop: contact to dtn://8ac027f3a4daf768/ opens in 3 s
+interop: sample bundle: 291 bytes to dtn://b727c8f6ec30acd7/interop-sample
+interop: µD3TN v0.15.2 (commit 6b18b267ce79ac0c8d8f7dbce5389f2acef0ca40) is up as dtn://interop-node/, MTCP in on 127.0.0.1:50311
+interop: contact to dtn://b727c8f6ec30acd7/ opens in 3 s
 interop: sent the sample bundle to µD3TN over MTCP
-interop: µD3TN log: Received new bundle 0x1052ecb10 from "dtn://cosmosd-dev/" to "dtn://8ac027f3a4daf768/interop-sample" via CLA mtcp
-interop: µD3TN log: TX of bundle 0x1052ecb10 to "dtn://8ac027f3a4daf768/" via "mtcp:127.0.0.1:64742" OK
+interop: µD3TN log: Received new bundle 0x8c3004300 from "dtn://cosmosd-dev/" to "dtn://b727c8f6ec30acd7/interop-sample" via CLA mtcp
+interop: µD3TN log: TX of bundle 0x8c3004300 to "dtn://b727c8f6ec30acd7/" via "mtcp:127.0.0.1:50312" OK
 interop: receiver got 293 bytes back
 interop: decoded by cosmosd, before -> after:
-  publisher=8ac027f3a4daf768 -> 8ac027f3a4daf768
+  publisher=b727c8f6ec30acd7 -> b727c8f6ec30acd7
   content_id=interop-sample -> interop-sample
   kind=segment -> segment
   sequence=0 -> 0
   payload_blake3=626e19b68ffd60a9f1d06e2277f8fb78dc0c5830ac41789bb15cf55032eb98b1 -> 626e19b68ffd60a9f1d06e2277f8fb78dc0c5830ac41789bb15cf55032eb98b1
   payload_len=31 -> 31
   source_node=cosmosd-dev -> cosmosd-dev
-  age_ms=0 -> 2816
+  age_ms=0 -> 2474
   hop_count=0 -> 1
   previous_node=none -> none
-INTEROP PASS: µD3TN v0.15.2 (commit 6b18b267ce79ac0c8d8f7dbce5389f2acef0ca40) received, stored and forwarded a cosmosd bundle with block 192 intact
+INTEROP PASS: µD3TN v0.15.2 (commit 6b18b267ce79ac0c8d8f7dbce5389f2acef0ca40) received, stored and forwarded a cosmosd bundle, and block 192 still decodes
 ```
 
-µD3TN changed what RFC 9171 lets a forwarding node change.
+The decoded fields show what µD3TN did to the bundle.
 
-- It added the 2816 ms it held the bundle to the age block. Creation time is zero, so the age block is the only clock. µD3TN used it.
+- It added the time it held the bundle to the age block. Creation time is zero, so the age block is the only clock. µD3TN used it.
 - It raised the hop count from 0 to 1.
-- It did not add a previous node block.
-- It kept block 192 and the payload byte for byte. The bundle grew by 2 bytes because the age now needs a longer CBOR integer.
+- The decode shows no previous node block, so µD3TN did not add one.
+- Block 192 still decodes with the same content ID, kind and sequence. The payload hash is the same.
+
+The script does not compare raw blocks. It checks only the decoded fields listed above.
 
 ## What this proves
 
 - A stock BPv7 node decodes a cosmosd bundle and accepts it as valid RFC 9171.
 - It stores the bundle while no contact is open, and forwards it when one opens.
-- It carries block 192, which it does not know, without changing it. Block control flags of 0 work as intended.
+- It carries block 192, which it does not know, and forwards it in a form cosmosd still decodes to the same content ID, kind and sequence. Block control flags of 0 did not make it drop the block or the bundle.
 - It routes on our `dtn://<publisher-key-id>/<content-id>` destination like any other `dtn` EID.
 - It keeps age-based time for a bundle with creation time zero.
+- It raises the hop count when it forwards.
 - What it forwards still decodes with cosmosd's own decoder.
 
 ## What this does not prove

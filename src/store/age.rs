@@ -27,10 +27,12 @@ const CLOCK_KEY: &[u8] = b"mono_ms";
 
 /// A persisted base plus the time elapsed in this run.
 ///
-/// Known limit: time the process spends down is not counted. After a restart
-/// the clock resumes from the last flush, so a bundle held across a long
-/// outage looks younger than it is. The reaper flushes every tick to keep the
-/// loss to a few minutes of an unclean exit.
+/// Known limits: time the process is down, or the OS is suspended, is not
+/// counted. After a restart the clock resumes from the last flush, so a bundle
+/// held across an outage looks younger than it is. The reaper flushes every 5
+/// minutes and a clean stop (Ctrl+C, SIGTERM) flushes once. An unclean stop
+/// (crash, power loss, kill -9) can lose up to the 5 minute flush interval of
+/// counted hold time, on each occurrence.
 pub struct SystemMono {
     tree: sled::Tree,
     base_ms: u64,
@@ -106,5 +108,19 @@ mod tests {
         second.flush().unwrap();
         let third = SystemMono::open(tree).unwrap();
         assert!(third.now_ms() >= 10_000);
+    }
+
+    #[test]
+    fn store_flush_persists_elapsed_time_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        {
+            let store = crate::store::BundleStore::open(path).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            store.flush_clock().unwrap();
+        }
+        // The flush ran after 50 ms of elapsed time, so the base is at least that.
+        let store = crate::store::BundleStore::open(path).unwrap();
+        assert!(store.clock.now_ms() >= 50);
     }
 }

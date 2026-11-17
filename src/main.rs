@@ -341,6 +341,7 @@ async fn serve(
     }
 
     // 8. HTTP API server
+    let flush_store = store.clone();
     let state = ApiState { store, node_id, peers: peer_manager, delay: std::time::Duration::from_secs(delay) };
     let app = api::router(state);
     let addr = format!("{}:{}", bind, port);
@@ -352,8 +353,35 @@ async fn serve(
     info!("  GET  http://{}/peers", addr);
     info!("  POST http://{}/ingest", addr);
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    // Clean stop: persist the expiry clock so held time is not lost.
+    flush_store.flush_clock()?;
+    info!("Store clock flushed, shutting down");
     Ok(())
+}
+
+/// Resolves on Ctrl+C or, on unix, SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term => {},
+    }
 }
 
 #[cfg(test)]

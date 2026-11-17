@@ -126,8 +126,8 @@ enum Command {
         #[arg(long, requires = "content_id")]
         live: Option<String>,
 
-        /// Content ID for a live stream.
-        #[arg(long)]
+        /// Content ID for a live stream: 1 to 64 of A-Z a-z 0-9 . _ -
+        #[arg(long, value_parser = parse_content_id)]
         content_id: Option<String>,
 
         /// Content title. Defaults to the filename stem.
@@ -220,6 +220,12 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// clap parser for `--content-id`.
+fn parse_content_id(s: &str) -> Result<String> {
+    bundle::check_content_id(s)?;
+    Ok(s.to_string())
 }
 
 fn default_key_dir() -> Result<PathBuf> {
@@ -500,6 +506,15 @@ mod tests {
             assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", token]).is_err(), "{token:?}");
         }
         assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", "s3cret"]).is_ok());
+    }
+
+    #[test]
+    fn live_content_id_must_be_valid() {
+        let parse = |id: &str| Cli::try_parse_from(["cosmosd", "ingest", "--live", "udp://x", "--content-id", id]);
+        assert!(parse("match_1").is_ok());
+        for bad in ["bad id", "a/b", ""] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

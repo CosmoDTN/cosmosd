@@ -72,13 +72,17 @@ pub struct ContentInfo {
     pub created_at_ms: i64,
 }
 
-/// A content ID must be non-empty and free of `/`, since it is one URI segment.
+/// Longest content ID, in bytes.
+pub const MAX_CONTENT_ID_LEN: usize = 64;
+
+/// A content ID is 1 to 64 characters from `[A-Za-z0-9._-]`. It is one URI
+/// segment in bundle destinations, store keys and playback URLs.
 pub fn check_content_id(content_id: &str) -> Result<()> {
-    if content_id.is_empty() {
-        bail!("content id must not be empty");
+    if content_id.is_empty() || content_id.len() > MAX_CONTENT_ID_LEN {
+        bail!("content id {content_id:?} must be 1 to {MAX_CONTENT_ID_LEN} characters long");
     }
-    if content_id.contains('/') {
-        bail!("content id {content_id:?} must not contain '/'");
+    if !content_id.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-')) {
+        bail!("content id {content_id:?} may only use letters, digits, '.', '_' and '-'");
     }
     Ok(())
 }
@@ -138,7 +142,7 @@ pub struct Bundle {
 }
 
 impl Bundle {
-    /// A segment bundle. Errors when `content_id` is empty or contains `/`.
+    /// A segment bundle. Errors when `content_id` fails [`check_content_id`].
     pub fn segment(
         publisher: &KeyId,
         content_id: &str,
@@ -304,6 +308,19 @@ mod tests {
             live,
             segments: vec![],
         }
+    }
+
+    #[test]
+    fn content_id_allows_only_safe_chars() {
+        for ok in ["a", "Show_1.v2-final", &"x".repeat(64)] {
+            assert!(check_content_id(ok).is_ok(), "{ok:?}");
+        }
+        for bad in ["", &"x".repeat(65), "a/b", "a b", "a?b", "a%2Fb", "film\u{e9}", "a\nb"] {
+            assert!(check_content_id(bad).is_err(), "{bad:?}");
+        }
+        let make = |id: &str| Bundle::segment(&publisher(), id, "t", 0, "video/mp2t", Priority::Vod, vec![], "n");
+        assert!(make("good_id").is_ok());
+        assert!(make("bad id").is_err());
     }
 
     #[test]

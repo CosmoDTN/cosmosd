@@ -259,6 +259,21 @@ mod tests {
         let mut b = sample(vec![]);
         b.info.content_id = "a/b".into();
         assert!(encode_bundle(&b).is_err());
+        b.info.content_id = "a~b".into();
+        assert!(encode_bundle(&b).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_a_content_id_outside_the_allowed_set() {
+        // Another BPv7 node could send `~`, which is fine in a URI but not in a content id.
+        let mut s = stock(&encode_bundle(&sample(b"x".to_vec())).unwrap());
+        s.primary.destination = EndpointID::try_from("dtn://0123456789abcdef/a~b").unwrap();
+        let block = s.canonicals.iter_mut().find(|c| c.block_type == CONTENT_BLOCK_TYPE).unwrap();
+        let mut info = sample(vec![]).info;
+        info.content_id = "a~b".into();
+        block.set_data(CanonicalData::Unknown(codec::encode(&info).unwrap()));
+        let err = decode_bundle(&s.to_cbor()).unwrap_err().to_string();
+        assert!(err.contains("content id"), "{err}");
     }
 
     #[test]

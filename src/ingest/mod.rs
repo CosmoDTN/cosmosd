@@ -135,6 +135,19 @@ pub(crate) async fn check_daemon(client: &reqwest::Client, daemon: &str) -> Resu
 
 // === File ingest ===
 
+/// A valid content ID made from a file name: lowercase ASCII letters, digits
+/// and `_`, at most 40 characters. A name with none of those gives `untitled`.
+pub fn content_id_from_name(name: &str) -> String {
+    let id: String = name
+        .to_lowercase()
+        .replace(' ', "_")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(40)
+        .collect();
+    if id.is_empty() { "untitled".to_string() } else { id }
+}
+
 pub async fn ingest_file(
     file: PathBuf,
     title: Option<String>,
@@ -148,16 +161,7 @@ pub async fn ingest_file(
             .to_string_lossy()
             .to_string()
     });
-    let content_id = file
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase()
-        .replace(' ', "_")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .take(40)
-        .collect::<String>();
+    let content_id = content_id_from_name(&file.file_stem().unwrap_or_default().to_string_lossy());
 
     // 1. Check ffmpeg is available
     which_ffmpeg().context("ffmpeg not found — install it: apt install ffmpeg / brew install ffmpeg")?;
@@ -222,6 +226,20 @@ pub async fn ingest_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_id_from_name_is_always_valid() {
+        assert_eq!(content_id_from_name("My Movie (2024)"), "my_movie_2024");
+        assert_eq!(content_id_from_name("Am\u{e9}lie"), "amlie");
+        assert_eq!(content_id_from_name("\u{65e5}\u{672c}"), "untitled");
+        assert_eq!(content_id_from_name(""), "untitled");
+        let long = content_id_from_name(&"a".repeat(100));
+        assert_eq!(long.len(), 40);
+        for name in ["My Movie (2024)", "Am\u{e9}lie", "\u{65e5}\u{672c}", "a/b\\c", &"z".repeat(100)] {
+            let id = content_id_from_name(name);
+            assert!(crate::bundle::check_content_id(&id).is_ok(), "{name:?} gave {id:?}");
+        }
+    }
 
     #[test]
     fn parses_extinf_entries() {

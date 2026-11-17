@@ -42,7 +42,7 @@ The destination is `dtn://<publisher-key-id>/<content-id>`.
 
 - The publisher key ID is 16 lowercase hex characters. It is the first 8 bytes of BLAKE3 of the publisher's Ed25519 public key.
 - The content ID is chosen by the publisher. It is unique only within that publisher.
-- A content ID must not be empty. It must not contain `/`.
+- A content ID is 1 to 64 characters long. It uses only ASCII letters, digits, `.`, `_` and `-`. So it is always one URI segment and never needs escaping.
 - Identity is the pair of publisher key ID and content ID.
 
 A decoder takes the publisher from the node part of the destination. It takes the content ID from the service part. The content ID in block 192 must match the one in the destination. If it does not, the bundle is refused.
@@ -106,6 +106,7 @@ A decoder refuses a bundle, with an error and never a panic, when:
 - the bytes are not a valid RFC 9171 bundle,
 - the bundle fails RFC 9171 validation,
 - the destination is not `dtn://<publisher>/<content-id>`,
+- the content ID breaks the rule in "Destination URI",
 - block 192 is missing or does not decode,
 - the content IDs in block 192 and the destination differ,
 - the bundle age block is missing,

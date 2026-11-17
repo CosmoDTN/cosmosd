@@ -763,7 +763,8 @@ mod tests {
     async fn bad_content_id_is_400() {
         let (state, _dir) = test_state_with_key(Some(PublisherKey::generate()));
         let app = local_app(state);
-        for cid in ["a/b", ""] {
+        let long = "x".repeat(65);
+        for cid in ["a/b", "", "bad id!", "caf\u{e9}", long.as_str()] {
             let res = send(&app, post_json("/ingest", &ingest_body(cid, 0, "vod", b"ts"))).await;
             assert_eq!(res.status(), StatusCode::BAD_REQUEST, "ingest {cid:?}");
             let res = send(&app, post_json("/ingest/finish", &finish_body(cid))).await;

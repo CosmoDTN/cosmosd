@@ -5,6 +5,10 @@ Starts two cosmosd nodes on localhost, ingests synthetic video segments
 into node A, and watches them propagate automatically to node B via
 epidemic routing — no internet required.
 
+Node A signs what it ingests with a fresh publisher key. Node B pairs that
+key, so it accepts the content. Both key dirs are temp dirs. Both nodes run
+with --delay 0, so the near_live playlist lists segments as soon as they land.
+
 Requirements:
     cosmosd binary must be built or installed
     pip install requests
@@ -100,12 +104,18 @@ def push_segment(url: str, content_id: str, title: str, seq: int) -> str:
     return r.json()["bundle_id"]
 
 
-def catalog_has(url: str, content_id: str) -> bool:
-    try:
-        r = requests.get(f"{url}/catalog", timeout=5)
-        return any(c["content_id"] == content_id for c in r.json())
-    except Exception:
-        return False
+def finish(url: str, content_id: str) -> dict:
+    r = requests.post(f"{url}/ingest/finish", json={"content_id": content_id}, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def keys(binary: str, key_dir: str, *args: str) -> str:
+    out = subprocess.run(
+        [binary, "keys", "--key-dir", key_dir, *args],
+        check=True, capture_output=True, text=True,
+    )
+    return out.stdout
 
 
 def segment_count(url: str, content_id: str) -> int:
@@ -148,6 +158,15 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cosmosd_demo_") as tmp:
         store_a = f"{tmp}/node-a"
         store_b = f"{tmp}/node-b"
+        keys_a = f"{tmp}/keys-a"
+        keys_b = f"{tmp}/keys-b"
+
+        # ── 0. Keys: A publishes, B pairs A ──────────────────────────
+        step("Creating Node A's publisher key and pairing it on Node B")
+        keys(args.binary, keys_a, "init")
+        pairing = keys(args.binary, keys_a, "show").splitlines()[0]
+        keys(args.binary, keys_b, "pair", pairing)
+        ok(f"Node B trusts {pairing[:24]}...")
 
         # ── 1. Start node A ──────────────────────────────────────────
         step("Starting Node A  (the ingest node)")
@@ -159,6 +178,8 @@ def main() -> None:
                 "--store",      store_a,
                 "--node-id",    "node-alpha",
                 "--relay-token", "demo-alpha",
+                "--key-dir",    keys_a,
+                "--delay",      "0",
                 "--no-discovery",
             ],
             stdout=subprocess.DEVNULL,
@@ -182,6 +203,8 @@ def main() -> None:
                 "--node-id",    "node-beta",
                 "--peer",       "127.0.0.1:17781@demo-alpha",
                 "--relay-token", "demo-beta",
+                "--key-dir",    keys_b,
+                "--delay",      "0",
                 "--no-discovery",
             ],
             stdout=subprocess.DEVNULL,
@@ -205,6 +228,8 @@ def main() -> None:
             bundle_id = push_segment("http://127.0.0.1:17780", content_id, title, i)
             ok(f"seg {i:05d}  →  {bundle_id}")
             time.sleep(0.1)
+        manifest = finish("http://127.0.0.1:17780", content_id)
+        ok(f"signed manifest  →  {manifest['manifest_id']} (version {manifest['version']})")
 
         # ── 4. Wait for epidemic sync to reach node B ────────────────
         print()
@@ -214,7 +239,8 @@ def main() -> None:
         dots     = 0
 
         while time.time() < deadline:
-            if catalog_has("http://127.0.0.1:17790", content_id):
+            # Older segments arrive as backfill, a few per sync, so wait for all.
+            if segment_count("http://127.0.0.1:17790", content_id) >= args.segments:
                 synced = True
                 break
             print(f"   {DIM}{'.' * (dots % 6 + 1)}{RESET}", end="\r")

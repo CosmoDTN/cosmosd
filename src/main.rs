@@ -9,11 +9,15 @@
 //!   cosmosd serve --bind 0.0.0.0                     # Expose API on all interfaces
 //!   cosmosd ingest /path/to/movie.mkv                # Ingest a local file
 //!   cosmosd ingest /path/to/movie.mkv --title "Dune" # With custom title
+//!   cosmosd ingest --live udp://127.0.0.1:5000 --content-id demo  # Live stream
 
 mod api;
 mod auth;
 mod bundle;
+// Used by the store, router and API from Tasks 2/4 onward.
+mod codec;
 mod discovery;
+mod ingest;
 mod peer;
 mod router;
 mod store;
@@ -22,8 +26,7 @@ mod transport;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use base64::Engine;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -56,7 +59,9 @@ enum Command {
         relay_port: u16,
 
         /// Known peers to sync with (relay addresses, e.g. 192.168.1.5:7778).
-        /// Pass multiple times: --peer A --peer B
+        /// Pass multiple times: --peer A --peer B.
+        /// A token follows the first `@` (host:port@token); it is presented
+        /// only to that peer.
         #[arg(long = "peer")]
         peers: Vec<String>,
 
@@ -68,26 +73,51 @@ enum Command {
         #[arg(long)]
         node_id: Option<String>,
 
-        /// Optional shared secret for relay authentication.
-        /// If set, peers must supply the same token to sync.
-        #[arg(long)]
+        /// Optional shared secret guarding our relay port: peers that dial us
+        /// must present it. Tokens for peers we dial go in `--peer host:port@token`.
+        #[arg(long, value_parser = auth::non_blank_token)]
         relay_token: Option<String>,
 
-        /// Disable mDNS peer discovery (useful in controlled environments).
+        /// Disable peer discovery: no mDNS, and peers that connect to us are not
+        /// dialed back. Only --peer and POST /peers peers are synced with.
         #[arg(long, default_value = "false")]
         no_discovery: bool,
+
+        /// Run the relay without a --relay-token even with --no-discovery (the
+        /// ground role) or on a machine that has a public IPv4 address.
+        #[arg(long, default_value = "false")]
+        open_relay: bool,
 
         /// Bind address for the HTTP API.
         /// Use 0.0.0.0 to expose the API on all interfaces (e.g. for remote access).
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+
+        /// Seconds the viewer plays behind live (live playlists list only
+        /// segments this old). Also the window of newest segments a gateway
+        /// pulls first. Use the same value on the gateway and cabin nodes.
+        #[arg(long, default_value = "120")]
+        delay: u64,
+
+        /// Seconds between syncs with a healthy peer.
+        #[arg(long, default_value = "5")]
+        sync_interval: u64,
     },
 
-    /// Ingest a local video file into the running cosmosd daemon.
-    /// Requires ffmpeg to be installed. The daemon must be running.
+    /// Ingest a local video file, or a live stream (--live), into the running
+    /// cosmosd daemon. Requires ffmpeg to be installed. The daemon must be running.
     Ingest {
         /// Path to the video file (mkv, mp4, avi, etc.).
-        file: PathBuf,
+        #[arg(required_unless_present = "live", conflicts_with = "live")]
+        file: Option<PathBuf>,
+
+        /// Live input URL for ffmpeg (e.g. udp://127.0.0.1:5000). Needs --content-id.
+        #[arg(long, requires = "content_id")]
+        live: Option<String>,
+
+        /// Content ID for a live stream.
+        #[arg(long)]
+        content_id: Option<String>,
 
         /// Content title. Defaults to the filename stem.
         #[arg(long)]
@@ -100,6 +130,10 @@ enum Command {
         /// Bundle priority: vod, near_live, or live.
         #[arg(long, default_value = "vod")]
         priority: String,
+
+        /// Live only: total bitrate cap in kbps (video + 128 kbps audio).
+        #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u32).range(400..))]
+        max_bitrate: u32,
     },
 }
 
@@ -114,11 +148,19 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, bind } => {
-            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, bind).await?;
+        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval } => {
+            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval).await?;
         }
-        Command::Ingest { file, title, daemon, priority } => {
-            ingest_file(file, title, daemon, priority).await?;
+        Command::Ingest { file, live, content_id, title, daemon, priority, max_bitrate } => {
+            match (file, live) {
+                (_, Some(url)) => {
+                    let content_id = content_id.expect("clap enforces --content-id with --live");
+                    let title = title.unwrap_or_else(|| content_id.clone());
+                    ingest::ingest_live(url, content_id, title, daemon, max_bitrate).await?;
+                }
+                (Some(file), None) => ingest::ingest_file(file, title, daemon, priority).await?,
+                (None, None) => unreachable!("clap requires FILE or --live"),
+            }
         }
     }
 
@@ -133,7 +175,10 @@ async fn serve(
     initial_peers: Vec<String>,
     relay_token: Option<String>,
     no_discovery: bool,
+    open_relay: bool,
     bind: String,
+    delay: u64,
+    sync_interval: u64,
 ) -> Result<()> {
     let node_id = node_id.unwrap_or_else(|| {
         hostname::get()
@@ -142,21 +187,35 @@ async fn serve(
             .unwrap_or_else(|| "cosmosd-node".to_string())
     });
 
+    auth::check_open_relay(relay_token.is_some(), open_relay, no_discovery)?;
+
     info!("CosmosD node:  {}", node_id);
     info!("Bundle store:  {}", store_path);
     info!("HTTP API:      http://{}:{}", bind, port);
     info!("Relay port:    {}", relay_port);
 
+    let peers = initial_peers.iter().map(|a| auth::parse_peer(a)).collect::<Result<Vec<_>>>()?;
     let store = Arc::new(BundleStore::open(&store_path)?);
 
     // 1. Relay auth
     let relay_auth = Arc::new(RelayAuth::new(relay_token));
 
     // 2. Epidemic router — shared by peer manager
-    let epidemic_router = Arc::new(EpidemicRouter::new(store.clone(), node_id.clone()));
+    let epidemic_router = Arc::new(EpidemicRouter::new(
+        store.clone(),
+        node_id.clone(),
+        relay_port,
+        std::time::Duration::from_secs(delay),
+    ));
 
     // 3. Peer manager — outgoing sync + incoming relay
-    let peer_manager = Arc::new(PeerManager::new(epidemic_router, relay_auth, initial_peers));
+    let peer_manager = Arc::new(PeerManager::new(
+        epidemic_router,
+        relay_auth,
+        peers,
+        std::time::Duration::from_secs(sync_interval),
+    )
+    .with_incoming_registration(!no_discovery));
 
     // 4. Background: reap expired bundles every 5 minutes
     {
@@ -202,7 +261,7 @@ async fn serve(
     }
 
     // 8. HTTP API server
-    let state = ApiState { store, node_id, peers: peer_manager };
+    let state = ApiState { store, node_id, peers: peer_manager, delay: std::time::Duration::from_secs(delay) };
     let app = api::router(state);
     let addr = format!("{}:{}", bind, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -213,118 +272,19 @@ async fn serve(
     info!("  GET  http://{}/peers", addr);
     info!("  POST http://{}/ingest", addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
 }
 
-// === Ingest subcommand ===
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn ingest_file(
-    file: PathBuf,
-    title: Option<String>,
-    daemon: String,
-    priority: String,
-) -> Result<()> {
-    let file = file.canonicalize().context("File not found")?;
-    let title = title.unwrap_or_else(|| {
-        file.file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
-    let content_id = file
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase()
-        .replace(' ', "_")
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .take(40)
-        .collect::<String>();
-
-    // 1. Check ffmpeg is available
-    which_ffmpeg().context("ffmpeg not found — install it: apt install ffmpeg / brew install ffmpeg")?;
-
-    // 2. Check daemon is reachable
-    let client = reqwest::Client::new();
-    client
-        .get(format!("{}/health", daemon))
-        .send()
-        .await
-        .context("Cannot reach cosmosd — is it running? cosmosd serve")?;
-
-    info!("Ingesting: {}", title);
-    info!("File:      {}", file.display());
-    info!("Content ID:{}", content_id);
-    info!("Daemon:    {}", daemon);
-
-    // 3. Chunk into HLS segments with ffmpeg
-    let tmp = tempfile::tempdir()?;
-    let hls_dir = tmp.path();
-
-    info!("Chunking with ffmpeg...");
-    let status = std::process::Command::new("ffmpeg")
-        .args([
-            "-y", "-i", file.to_str().unwrap(),
-            "-map", "0:v:0",   // first video stream only
-            "-map", "0:a:0",   // first audio stream only
-            "-codec", "copy",
-            "-hls_time", "10",
-            "-hls_list_size", "0",
-            "-hls_segment_filename", &format!("{}/seg%05d.ts", hls_dir.display()),
-            "-f", "hls",
-            &format!("{}/index.m3u8", hls_dir.display()),
-        ])
-        .status()
-        .context("ffmpeg failed to run")?;
-
-    anyhow::ensure!(status.success(), "ffmpeg exited with error");
-
-    // 4. Push each segment to cosmosd
-    let mut segments: Vec<_> = std::fs::read_dir(hls_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|x| x == "ts").unwrap_or(false))
-        .map(|e| e.path())
-        .collect();
-    segments.sort();
-
-    info!("Pushing {} segments to {}...", segments.len(), daemon);
-
-    for (i, seg_path) in segments.iter().enumerate() {
-        let payload = std::fs::read(seg_path)?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
-
-        let resp = client
-            .post(format!("{}/ingest", daemon))
-            .json(&serde_json::json!({
-                "content_id":    content_id,
-                "content_title": title,
-                "sequence":      i,
-                "mime_type":     "video/mp2t",
-                "priority":      priority,
-                "payload_b64":   b64,
-            }))
-            .send()
-            .await
-            .with_context(|| format!("Failed to push segment {}", i))?;
-
-        let data: serde_json::Value = resp.json().await?;
-        info!("  seg{:05} → {} (stored={})", i, data["bundle_id"], data["stored"]);
+    #[test]
+    fn relay_token_must_not_be_blank() {
+        for token in ["", "   "] {
+            assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", token]).is_err(), "{token:?}");
+        }
+        assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", "s3cret"]).is_ok());
     }
-
-    info!("Done: {} ({} segments)", title, segments.len());
-    info!("Play: ffplay {}/play/{}", daemon, content_id);
-    Ok(())
-}
-
-fn which_ffmpeg() -> Option<()> {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()
-        .filter(|s| s.success())
-        .map(|_| ())
 }

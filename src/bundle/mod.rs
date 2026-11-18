@@ -7,6 +7,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Default HLS segment duration in milliseconds.
+pub const DEFAULT_SEGMENT_MS: u32 = 10_000;
+
 // === Priority ===
 
 /// Delivery priority — controls queue ordering and TTL defaults.
@@ -80,7 +83,14 @@ pub struct Bundle {
     /// blake3 hash of `payload` for integrity verification.
     pub payload_hash: String,
 
+    /// Wall-clock time when this bundle was created.
+    pub created_at: DateTime<Utc>,
+
+    /// Playback duration of the segment in milliseconds.
+    pub duration_ms: u32,
+
     /// Raw bytes — one HLS .ts segment or .m3u8 playlist.
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 
     /// Node that originally created this bundle.
@@ -104,7 +114,8 @@ impl Bundle {
         source_node: &str,
     ) -> Self {
         let hash = blake3::hash(&payload).to_hex().to_string();
-        let expires_at = Utc::now() + chrono::Duration::seconds(priority.default_ttl_secs());
+        let created_at = Utc::now();
+        let expires_at = created_at + chrono::Duration::seconds(priority.default_ttl_secs());
 
         Bundle {
             id: BundleId::new(content_id, sequence),
@@ -113,11 +124,38 @@ impl Bundle {
             mime_type: mime_type.to_string(),
             priority,
             expires_at,
+            created_at,
+            duration_ms: DEFAULT_SEGMENT_MS,
             payload_hash: hash,
             payload,
             source_node: source_node.to_string(),
             hop_count: 0,
             bundle_uuid: Uuid::new_v4(),
+        }
+    }
+
+    /// Set the segment playback duration.
+    pub fn with_duration_ms(mut self, ms: u32) -> Self {
+        self.duration_ms = ms;
+        self
+    }
+
+    /// The content stream this bundle belongs to (the id before the last `/`).
+    pub fn content_id(&self) -> &str {
+        self.id.as_str().rsplit_once('/').map_or(self.id.as_str(), |(c, _)| c)
+    }
+
+    /// Routing fields without the payload.
+    pub fn meta(&self) -> BundleMeta {
+        BundleMeta {
+            id: self.id.0.clone(),
+            content_id: self.content_id().to_string(),
+            content_title: self.content_title.clone(),
+            sequence: self.sequence,
+            priority: self.priority,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            duration_ms: self.duration_ms,
         }
     }
 
@@ -130,6 +168,28 @@ impl Bundle {
     pub fn verify(&self) -> bool {
         let actual = blake3::hash(&self.payload).to_hex().to_string();
         actual == self.payload_hash
+    }
+}
+
+// === BundleMeta ===
+
+/// A bundle's routing metadata, without the payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BundleMeta {
+    pub id: String,
+    pub content_id: String,
+    pub content_title: String,
+    pub sequence: u32,
+    pub priority: Priority,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub duration_ms: u32,
+}
+
+impl BundleMeta {
+    /// Returns true if the bundle has not yet expired.
+    pub fn is_valid(&self) -> bool {
+        Utc::now() < self.expires_at
     }
 }
 
@@ -176,6 +236,16 @@ mod tests {
     #[test]
     fn live_priority_has_shorter_ttl_than_vod() {
         assert!(Priority::Live.default_ttl_secs() < Priority::Vod.default_ttl_secs());
+    }
+
+    #[test]
+    fn meta_carries_routing_fields() {
+        let b = make_bundle(Priority::Live).with_duration_ms(9_500);
+        let m = b.meta();
+        assert_eq!(m.id, "test_content/00000");
+        assert_eq!(m.content_id, "test_content");
+        assert_eq!(m.duration_ms, 9_500);
+        assert_eq!(m.priority, Priority::Live);
     }
 
     #[test]

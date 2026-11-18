@@ -16,22 +16,20 @@ use crate::peer::PeerManager;
 
 const SERVICE_TYPE: &str = "_cosmosd._tcp.local.";
 
+/// Our service record. Without addresses no peer can resolve it, so mdns-sd
+/// must fill them in from the host's interfaces (`addr_auto`).
+fn announcement(node_id: &str, relay_port: u16) -> Result<ServiceInfo> {
+    let host = format!("{}.local.", node_id.replace(' ', "-"));
+    Ok(ServiceInfo::new(SERVICE_TYPE, node_id, &host, "", relay_port, None)?.enable_addr_auto())
+}
+
 /// Announce this node and discover peers via mDNS.
 /// Runs forever — call from a background tokio task.
 pub async fn run(node_id: &str, relay_port: u16, peers: Arc<PeerManager>) -> Result<()> {
     let mdns = ServiceDaemon::new()?;
 
     // 1. Announce ourselves
-    let host = format!("{}.local.", node_id.replace(' ', "-"));
-    let service = ServiceInfo::new(
-        SERVICE_TYPE,
-        node_id,
-        &host,
-        "",        // IP auto-detected by mdns-sd
-        relay_port,
-        None,
-    )?;
-    mdns.register(service)?;
+    mdns.register(announcement(node_id, relay_port)?)?;
     info!("mDNS: announced {} on port {}", node_id, relay_port);
 
     // 2. Browse for other cosmosd nodes
@@ -60,5 +58,18 @@ pub async fn run(node_id: &str, relay_port: u16, peers: Arc<PeerManager>) -> Res
                 warn!("mDNS receive error: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn announcement_gets_host_addresses() {
+        let info = announcement("cabin", 37778).unwrap();
+        assert!(info.is_addr_auto(), "a record with no addresses never resolves");
+        assert_eq!(info.get_port(), 37778);
+        assert_eq!(info.get_fullname(), "cabin._cosmosd._tcp.local.");
     }
 }

@@ -115,7 +115,9 @@ cosmosd serve
 # Ingest a local video file (requires ffmpeg + daemon running)
 cosmosd ingest /path/to/movie.mkv
 cosmosd ingest /path/to/movie.mkv --title "Interstellar"
-cosmosd ingest /path/to/movie.mkv --daemon http://10.2.0.119:7777
+cosmosd ingest /path/to/movie.mkv --daemon http://127.0.0.1:8888  # a daemon on another port
+# Ingest runs on the daemon's own host: POST /ingest answers only to localhost,
+# so a remote --daemon gets 403 Forbidden.
 
 # Start daemon
 
@@ -128,11 +130,14 @@ cosmosd serve --peer 192.168.1.5:7778 --peer 192.168.1.6:7778
 # Custom store path and node ID
 cosmosd serve --store /data/cosmosd --node-id iss-node-1
 
-# Require a shared secret for relay connections
+# Require a shared secret from peers that dial us
 cosmosd serve --relay-token my-secret
 
-# Disable mDNS auto-discovery (for controlled environments)
-cosmosd serve --no-discovery
+# Present a peer's token when dialing it (token follows the first @)
+cosmosd serve --peer ground.example.com:443@their-secret
+
+# Disable mDNS auto-discovery (for controlled environments; needs a token)
+cosmosd serve --no-discovery --relay-token my-secret
 ```
 
 All options:
@@ -141,28 +146,120 @@ All options:
 |------|---------|-------------|
 | `--port` | `7777` | HTTP API port (SDK and ingest connect here) |
 | `--relay-port` | `7778` | TCP relay port (peer-to-peer bundle sync) |
-| `--peer` | — | Known peer relay address; pass multiple times |
+| `--peer` | — | Known peer relay address, `host:port` or `host:port@token` (token after the first `@`, presented only to that peer); pass multiple times |
 | `--store` | `.cosmosd/store` | Bundle store directory |
 | `--node-id` | hostname | Human-readable node identifier |
-| `--relay-token` | — | Shared secret; peers must supply the same token |
-| `--no-discovery` | false | Disable mDNS auto-discovery |
+| `--relay-token` | — | Shared secret guarding our relay port; peers that dial us must present it. It is not sent to peers we dial |
+| `--open-relay` | false | Allow a relay with no `--relay-token` with `--no-discovery` or on a machine that has a public IPv4 address (otherwise `serve` refuses to start) |
+| `--no-discovery` | false | Disable discovery: no mDNS, and peers that connect in are not dialed back. This is the ground role, so it needs `--relay-token` (or `--open-relay`) |
 | `--bind` | `127.0.0.1` | HTTP API bind address (`0.0.0.0` to expose on all interfaces) |
+| `--delay` | `120` | Seconds the viewer plays behind live; also the window of newest segments a gateway pulls first. Use the same value on the gateway and cabin nodes |
+| `--sync-interval` | `5` | Seconds between syncs with a healthy peer |
+
+---
+
+## Live over a dropping link
+
+cosmosd can carry a live stream onto a plane over satellite Wi-Fi, where the
+link blinks for seconds and drops for minutes, and spread it around the cabin.
+There are three roles:
+
+- **Ground node**, on a machine with good internet. It transcodes a live source
+  and holds the segments. The gateway dials in to it, so it needs a reachable
+  relay port and a token:
+
+  ```bash
+  cosmosd serve --relay-port 443 --relay-token "$SECRET" --no-discovery
+  cosmosd ingest --live <stream URL> --content-id match --title "The match"
+  ```
+
+  Always run the ground relay with a token. `serve` refuses an open relay on a
+  public IPv4 address, but NAT, port forwarding and containers can expose a
+  relay that has no public address of its own, so a `--no-discovery` node
+  refuses to start without `--relay-token` (or `--open-relay`).
+
+  `ingest --live` reads any URL ffmpeg can (HLS, RTMP, SRT, UDP) and re-encodes
+  it to 720p H.264/AAC capped at `--max-bitrate` (default 1200 kbps total), in
+  10-second segments pushed as soon as each one closes. It restarts ffmpeg if
+  the source drops, and runs until Ctrl-C or SIGTERM.
+
+  Run the relay on **port 443**: plain TCP on 443 gets through many in-flight
+  networks that block odd ports. Networks that proxy or inspect HTTPS still
+  block it. On Linux, binding 443 needs root or
+  `setcap cap_net_bind_service=+ep`; or forward 443 to the default 7778.
+
+- **Gateway**, a laptop on the plane's paid Wi-Fi. It always dials out to the
+  ground node, never the reverse, and announces itself on the cabin LAN by mDNS.
+  The ground's token rides on the `--peer` argument, so the gateway holds it
+  without demanding it from the cabin nodes that dial in:
+
+  ```bash
+  cosmosd serve --peer "ground.example.com:443@$SECRET"
+  ```
+
+- **Cabin nodes**, other laptops on the same cabin LAN (a travel router you
+  bring, since plane Wi-Fi isolates clients). They find the gateway by mDNS and
+  serve the player to phones:
+
+  ```bash
+  cosmosd serve --bind 0.0.0.0
+  # watch: http://<laptop>:7777/play/match in Safari, VLC or ffplay
+  ```
+
+  A phone on the cabin LAN opens `http://<laptop-ip>:7777/` (the cabin node's
+  `--port`) in its browser and picks a title: the player page and hls.js are
+  built into cosmosd, so it needs no app and no internet.
+
+Playback is time-shifted, not buffered: `/play/<id>` lists only segments at
+least `--delay` seconds old (default 120), so everything newer is buffer that
+rides out link drops. A drop shorter than the delay is invisible to viewers.
+After a longer outage playback stalls, then jumps to the live edge minus the
+delay when the link returns; the gateway pulls that window first. A bigger
+`--delay` survives longer outages (up to the 30-minute live TTL). Set the same
+`--delay` on the gateway and the cabin nodes: the gateway's sets how much it
+pulls first, the cabin's how far behind live phones play.
+
+Sharing a paid in-flight Wi-Fi connection and redistributing a broadcast may
+break the airline's terms of service and the broadcaster's rights: check both
+before you use this.
+
+### Try it on one machine
+
+```bash
+scripts/demo-inflight.sh
+```
+
+Needs ffmpeg and a Rust toolchain, and takes about 17 minutes. It runs an ffmpeg
+test pattern into a ground node, a gateway that pulls it through `linksim` (a
+3 Mbps, 600 ms round-trip proxy, `examples/linksim.rs`), and a cabin node that
+finds the gateway by mDNS. A headless player (`examples/playcheck.rs`) watches
+the cabin while the script cuts the link for 30 seconds, then for 5 minutes.
+It checks that the short cut causes no stall, the long one does, and playback
+ends about 2 minutes behind live, then prints `DEMO PASS` or `DEMO FAIL: <why>`.
+Watch along with `ffplay http://127.0.0.1:37777/play/demo`; logs are kept in the
+temp directory it prints. If mDNS can't work on your machine,
+`DEMO_CABIN_PEER=1` gives the cabin an explicit `--peer` to the gateway instead.
 
 ---
 
 ## HTTP API
 
-The API binds to `127.0.0.1` only — it is local-only by design.
+The API binds to `127.0.0.1` by default. `--bind 0.0.0.0` exposes the read
+routes (`GET`) to the network, so phones can play; the write routes
+(`POST /ingest`, `POST /peers`) answer only to localhost, whatever `--bind`
+says, and return 403 to anyone else.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/` | Phone player page: lists titles and plays them (hls.js built in, no internet needed) |
+| `GET` | `/hls.min.js` | The embedded hls.js used by the player page |
 | `GET` | `/health` | Node status, version |
 | `GET` | `/catalog` | List all stored content |
 | `GET` | `/play/:content_id` | HLS M3U8 playlist |
 | `GET` | `/segment/:content_id/:sequence` | Raw `.ts` segment bytes |
-| `POST` | `/ingest` | Add a bundle (used by cosmoscast-ingest) |
+| `POST` | `/ingest` | Add a bundle (used by `cosmosd ingest`; localhost only) |
 | `GET` | `/peers` | Connected peers and sync status |
-| `POST` | `/peers` | Add a peer at runtime |
+| `POST` | `/peers` | Add a peer at runtime (localhost only) |
 
 ### Example: ingest a segment
 
@@ -177,6 +274,7 @@ curl -s -X POST http://localhost:7777/ingest \
     \"sequence\": 1,
     \"mime_type\": \"video/mp2t\",
     \"priority\": \"vod\",
+    \"duration_ms\": 10000,
     \"payload_b64\": \"$PAYLOAD_B64\"
   }"
 ```

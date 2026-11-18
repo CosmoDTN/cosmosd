@@ -10,11 +10,14 @@
 //!   cosmosd ingest /path/to/movie.mkv                # Ingest a local file
 //!   cosmosd ingest /path/to/movie.mkv --title "Dune" # With custom title
 //!   cosmosd ingest --live udp://127.0.0.1:5000 --content-id demo  # Live stream
+//!   cosmosd keys init                                # Create a publisher key
+//!   cosmosd keys show                                # Print pairing string and key ID
+//!   cosmosd keys pair cosmos-key:...                 # Trust a publisher
+//!   cosmosd dev-bundle --out sample.bundle           # Hidden: one sample bundle for interop tests
 
 mod api;
 mod auth;
 mod bundle;
-// Used by the store, router and API from Tasks 2/4 onward.
 mod codec;
 mod discovery;
 mod ingest;
@@ -22,11 +25,13 @@ mod peer;
 mod router;
 mod store;
 mod transport;
+mod trust;
+mod wire;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -102,6 +107,11 @@ enum Command {
         /// Seconds between syncs with a healthy peer.
         #[arg(long, default_value = "5")]
         sync_interval: u64,
+
+        /// Key directory (default $HOME/.config/cosmosd). Bundles from peers
+        /// are accepted only from this node's key and the keys paired here.
+        #[arg(long)]
+        key_dir: Option<PathBuf>,
     },
 
     /// Ingest a local video file, or a live stream (--live), into the running
@@ -115,8 +125,8 @@ enum Command {
         #[arg(long, requires = "content_id")]
         live: Option<String>,
 
-        /// Content ID for a live stream.
-        #[arg(long)]
+        /// Content ID for a live stream: 1 to 64 of A-Z a-z 0-9 . _ -
+        #[arg(long, value_parser = parse_content_id)]
         content_id: Option<String>,
 
         /// Content title. Defaults to the filename stem.
@@ -135,6 +145,44 @@ enum Command {
         #[arg(long, default_value = "1200", value_parser = clap::value_parser!(u32).range(400..))]
         max_bitrate: u32,
     },
+
+    /// Manage publisher keys and the keys this node trusts.
+    Keys {
+        /// Key directory (default $HOME/.config/cosmosd).
+        #[arg(long, global = true)]
+        key_dir: Option<PathBuf>,
+
+        #[command(subcommand)]
+        action: KeysCmd,
+    },
+
+    /// Write one sample RFC 9171 segment bundle (--out), or decode a bundle
+    /// file and print its fields (--check). For interop tests with other
+    /// BPv7 nodes, see scripts/interop-ud3tn.sh.
+    #[command(hide = true)]
+    DevBundle {
+        /// File to write the sample bundle to.
+        #[arg(long, required_unless_present = "check", conflicts_with = "check")]
+        out: Option<PathBuf>,
+
+        /// Bundle file to decode with wire::decode_bundle.
+        #[arg(long)]
+        check: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Create this node's publisher key.
+    Init,
+    /// Print this node's pairing string and key ID.
+    Show,
+    /// Trust a publisher, given its pairing string.
+    Pair { pairing: String },
+    /// Stop trusting a publisher, given its key ID.
+    Unpair { key_id: String },
+    /// List the paired key IDs.
+    List,
 }
 
 // === Entry point ===
@@ -148,8 +196,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval } => {
-            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval).await?;
+        Command::Serve { port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval, key_dir } => {
+            let key_dir = match key_dir {
+                Some(d) => d,
+                None => default_key_dir()?,
+            };
+            serve(port, relay_port, store, node_id, peers, relay_token, no_discovery, open_relay, bind, delay, sync_interval, key_dir).await?;
         }
         Command::Ingest { file, live, content_id, title, daemon, priority, max_bitrate } => {
             match (file, live) {
@@ -162,9 +214,124 @@ async fn main() -> Result<()> {
                 (None, None) => unreachable!("clap requires FILE or --live"),
             }
         }
+        Command::Keys { key_dir, action } => keys_command(key_dir, action)?,
+        Command::DevBundle { out, check } => dev_bundle_command(out, check)?,
     }
 
     Ok(())
+}
+
+/// clap parser for `--content-id`.
+fn parse_content_id(s: &str) -> Result<String> {
+    bundle::check_content_id(s)?;
+    Ok(s.to_string())
+}
+
+fn default_key_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set, pass --key-dir"))?;
+    Ok(PathBuf::from(home).join(".config/cosmosd"))
+}
+
+fn keys_command(key_dir: Option<PathBuf>, action: KeysCmd) -> Result<()> {
+    use trust::{pairing_string, parse_pairing_string, KeyId, PairedKeys, PublisherKey};
+
+    let dir = match key_dir {
+        Some(d) => d,
+        None => default_key_dir()?,
+    };
+    match action {
+        KeysCmd::Init => {
+            let key = PublisherKey::generate();
+            // save refuses to overwrite, so an existing key is never clobbered.
+            key.save(&dir).with_context(|| format!("a publisher key may already exist in {}", dir.display()))?;
+            println!("created publisher key {}", key.key_id());
+        }
+        KeysCmd::Show => {
+            let key = PublisherKey::load(&dir)?;
+            println!("{}", pairing_string(&key.public()));
+            println!("key id: {}", key.key_id());
+        }
+        KeysCmd::Pair { pairing } => {
+            let id = PairedKeys::open(&dir)?.pair(parse_pairing_string(&pairing)?)?;
+            println!("paired {id}");
+        }
+        KeysCmd::Unpair { key_id } => {
+            if PairedKeys::open(&dir)?.unpair(&KeyId(key_id.clone()))? {
+                println!("unpaired {key_id}");
+            } else {
+                anyhow::bail!("no paired key {key_id}");
+            }
+        }
+        KeysCmd::List => {
+            for id in PairedKeys::open(&dir)?.list() {
+                println!("{id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+// === Dev bundle ===
+
+/// Content ID, payload and source node of the sample bundle.
+const DEV_CONTENT_ID: &str = "interop-sample";
+const DEV_PAYLOAD: &[u8] = b"cosmosd interop sample segment\n";
+const DEV_SOURCE_NODE: &str = "cosmosd-dev";
+
+fn dev_bundle_command(out: Option<PathBuf>, check: Option<PathBuf>) -> Result<()> {
+    match (out, check) {
+        (Some(out), None) => {
+            std::fs::write(&out, dev_bundle_bytes()?).with_context(|| format!("writing {}", out.display()))?;
+            println!("wrote {}", out.display());
+        }
+        (None, Some(check)) => {
+            let bytes = std::fs::read(&check).with_context(|| format!("reading {}", check.display()))?;
+            print!("{}", describe_bundle(&bytes)?);
+        }
+        _ => unreachable!("clap requires exactly one of --out and --check"),
+    }
+    Ok(())
+}
+
+/// One segment bundle as RFC 9171 bytes. The publisher is a throwaway key
+/// that is never saved, so nothing will admit the segment. It is for
+/// carrying only.
+fn dev_bundle_bytes() -> Result<Vec<u8>> {
+    let publisher = trust::PublisherKey::generate().key_id();
+    let b = bundle::Bundle::segment(
+        &publisher,
+        DEV_CONTENT_ID,
+        "Interop sample",
+        0,
+        "video/mp2t",
+        bundle::Priority::Live,
+        DEV_PAYLOAD.to_vec(),
+        DEV_SOURCE_NODE,
+    )?;
+    wire::encode_bundle(&b)
+}
+
+/// Decode with `wire::decode_bundle` and list the fields, one `key=value`
+/// per line. The first five lines are the identity a carrier must not change.
+fn describe_bundle(bytes: &[u8]) -> Result<String> {
+    let b = wire::decode_bundle(bytes)?;
+    let kind = match b.info.kind {
+        bundle::BundleKind::Segment => "segment",
+        bundle::BundleKind::Manifest => "manifest",
+    };
+    Ok(format!(
+        "publisher={}\ncontent_id={}\nkind={kind}\nsequence={}\npayload_blake3={}\n\
+         payload_len={}\nsource_node={}\nage_ms={}\nhop_count={}\nprevious_node={}\n",
+        b.publisher,
+        b.info.content_id,
+        b.info.sequence,
+        blake3::hash(&b.payload).to_hex(),
+        b.payload.len(),
+        b.source_node,
+        b.age_ms,
+        b.hop_count,
+        b.previous_node.as_deref().unwrap_or("none"),
+    ))
 }
 
 async fn serve(
@@ -179,13 +346,9 @@ async fn serve(
     bind: String,
     delay: u64,
     sync_interval: u64,
+    key_dir: PathBuf,
 ) -> Result<()> {
-    let node_id = node_id.unwrap_or_else(|| {
-        hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "cosmosd-node".to_string())
-    });
+    let node_id = resolve_node_id(node_id)?;
 
     auth::check_open_relay(relay_token.is_some(), open_relay, no_discovery)?;
 
@@ -196,6 +359,10 @@ async fn serve(
 
     let peers = initial_peers.iter().map(|a| auth::parse_peer(a)).collect::<Result<Vec<_>>>()?;
     let store = Arc::new(BundleStore::open(&store_path)?);
+    let (own_key, trust) = load_trust(&key_dir)?;
+    // A publisher unpaired since the last run loses its content here.
+    let purged = store.purge_untrusted(&*trust)?;
+    info!("Untrusted:     removed {} bundles", purged);
 
     // 1. Relay auth
     let relay_auth = Arc::new(RelayAuth::new(relay_token));
@@ -206,6 +373,7 @@ async fn serve(
         node_id.clone(),
         relay_port,
         std::time::Duration::from_secs(delay),
+        trust,
     ));
 
     // 3. Peer manager — outgoing sync + incoming relay
@@ -217,7 +385,9 @@ async fn serve(
     )
     .with_incoming_registration(!no_discovery));
 
-    // 4. Background: reap expired bundles every 5 minutes
+    // 4. Background: reap expired bundles and flush the expiry clock every
+    //    5 minutes. A clean stop flushes too. This flush bounds the held
+    //    time an unclean stop can lose.
     {
         let store = store.clone();
         tokio::spawn(async move {
@@ -225,6 +395,9 @@ async fn serve(
             loop {
                 interval.tick().await;
                 let _ = store.reap_expired();
+                if let Err(e) = store.flush_clock() {
+                    tracing::warn!("Failed to flush the store clock: {}", e);
+                }
             }
         });
     }
@@ -261,7 +434,8 @@ async fn serve(
     }
 
     // 8. HTTP API server
-    let state = ApiState { store, node_id, peers: peer_manager, delay: std::time::Duration::from_secs(delay) };
+    let flush_store = store.clone();
+    let state = ApiState::new(store, node_id, peer_manager, std::time::Duration::from_secs(delay), own_key);
     let app = api::router(state);
     let addr = format!("{}:{}", bind, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -270,10 +444,66 @@ async fn serve(
     info!("  GET  http://{}/health", addr);
     info!("  GET  http://{}/catalog", addr);
     info!("  GET  http://{}/peers", addr);
+    info!("  GET  http://{}/play/<publisher>/<content_id>", addr);
     info!("  POST http://{}/ingest", addr);
+    info!("  POST http://{}/ingest/finish", addr);
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    // Clean stop: persist the expiry clock so held time is not lost.
+    flush_store.flush_clock()?;
+    info!("Store clock flushed, shutting down");
     Ok(())
+}
+
+/// `--node-id`, or the hostname, checked now: it goes into every bundle
+/// this node creates or forwards, so a bad one would fail every send.
+fn resolve_node_id(node_id: Option<String>) -> Result<String> {
+    let node_id = node_id.unwrap_or_else(|| {
+        hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "cosmosd-node".to_string())
+    });
+    wire::check_node_id(&node_id).context("pass a valid --node-id")?;
+    Ok(node_id)
+}
+
+/// The node's own key, if it has one, and a `Trust` of that key plus the keys
+/// paired in `key_dir`. A missing key dir gives a node that trusts nobody and
+/// can not ingest. Pairings are read once, so changes need a restart.
+fn load_trust(key_dir: &std::path::Path) -> Result<(Option<trust::PublisherKey>, Arc<trust::Trust>)> {
+    let own = trust::PublisherKey::load_if_present(key_dir)?;
+    let paired = trust::PairedKeys::open(key_dir)?;
+    match &own {
+        Some(k) => info!("Publisher key: {}", k.key_id()),
+        None => info!("Publisher key: none in {}", key_dir.display()),
+    }
+    info!("Paired keys:   {}", paired.list().len());
+    Ok((own.clone(), Arc::new(trust::Trust::new(own, paired))))
+}
+
+/// Resolves on Ctrl+C or, on unix, SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term => {},
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +516,75 @@ mod tests {
             assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", token]).is_err(), "{token:?}");
         }
         assert!(Cli::try_parse_from(["cosmosd", "serve", "--relay-token", "s3cret"]).is_ok());
+    }
+
+    #[test]
+    fn node_id_is_checked_at_startup() {
+        assert_eq!(resolve_node_id(Some("iss-node-1".into())).unwrap(), "iss-node-1");
+        for bad in ["", "a/b"] {
+            let err = resolve_node_id(Some(bad.into())).unwrap_err().to_string();
+            assert!(err.contains("--node-id"), "{bad:?}: {err}");
+        }
+        assert!(resolve_node_id(None).is_ok(), "the hostname is a valid node id here");
+    }
+
+    #[test]
+    fn live_content_id_must_be_valid() {
+        let parse = |id: &str| Cli::try_parse_from(["cosmosd", "ingest", "--live", "udp://x", "--content-id", id]);
+        assert!(parse("match_1").is_ok());
+        for bad in ["bad id", "a/b", ""] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn dev_bundle_needs_out_or_check() {
+        assert!(Cli::try_parse_from(["cosmosd", "dev-bundle"]).is_err());
+        assert!(Cli::try_parse_from(["cosmosd", "dev-bundle", "--out", "a", "--check", "b"]).is_err());
+        assert!(Cli::try_parse_from(["cosmosd", "dev-bundle", "--out", "a"]).is_ok());
+        assert!(Cli::try_parse_from(["cosmosd", "dev-bundle", "--check", "b"]).is_ok());
+    }
+
+    #[test]
+    fn dev_bundle_writes_a_bundle_both_decoders_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sample.bundle");
+        dev_bundle_command(Some(out.clone()), None).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+
+        let ours = wire::decode_bundle(&bytes).expect("wire::decode_bundle accepts the sample");
+        assert_eq!(ours.info.kind, bundle::BundleKind::Segment);
+        assert_eq!(ours.info.content_id, DEV_CONTENT_ID);
+        assert_eq!(ours.payload, DEV_PAYLOAD);
+        assert_eq!(ours.source_node, DEV_SOURCE_NODE);
+
+        let stock = bp7::bundle::Bundle::try_from(bytes.as_slice()).expect("stock bp7 decodes the sample");
+        stock.validate().expect("stock bp7 validates the sample");
+        assert!(stock.extension_block_by_type(wire::CONTENT_BLOCK_TYPE).is_some());
+        assert_eq!(stock.payload().unwrap(), &DEV_PAYLOAD.to_vec());
+    }
+
+    #[test]
+    fn dev_bundle_uses_a_new_key_each_time() {
+        let a = wire::decode_bundle(&dev_bundle_bytes().unwrap()).unwrap();
+        let b = wire::decode_bundle(&dev_bundle_bytes().unwrap()).unwrap();
+        assert_ne!(a.publisher, b.publisher);
+    }
+
+    #[test]
+    fn describe_bundle_lists_identity_first() {
+        let bytes = dev_bundle_bytes().unwrap();
+        let b = wire::decode_bundle(&bytes).unwrap();
+        let text = describe_bundle(&bytes).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], format!("publisher={}", b.publisher));
+        assert_eq!(lines[1], format!("content_id={DEV_CONTENT_ID}"));
+        assert_eq!(lines[2], "kind=segment");
+        assert_eq!(lines[3], "sequence=0");
+        assert_eq!(lines[4], format!("payload_blake3={}", blake3::hash(DEV_PAYLOAD).to_hex()));
+        assert!(text.contains("age_ms=0\n"));
+        assert!(text.contains("hop_count=0\n"));
+        assert!(text.contains("previous_node=none\n"));
+        assert!(describe_bundle(b"not a bundle").is_err());
     }
 }

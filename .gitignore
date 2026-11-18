@@ -32,3 +32,6 @@ docker-compose.override.yml
 perf.data
 perf.data.old
 flamegraph.svg
+
+# Local agent workflow notes
+.superpowers/

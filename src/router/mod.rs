@@ -4,16 +4,26 @@
 //! each has), compute the diff, and pull missing bundles. This is how
 //! content spreads through the mesh without any central coordination.
 //!
-//! Protocol v2 (CBOR frames, over any stream on the relay port):
-//!   1. Both sides send their manifest (version, relay port, id + priority)
-//!   2. Initiator orders the diff live-first and sends a pull request
-//!   3. Responder streams requested bundles, in that order
+//! Protocol v3 (CBOR frames, over any stream on the relay port):
+//!   1. Both sides send their manifest (version, relay port, and per bundle
+//!      its id, priority and content manifest version). It lists every
+//!      content manifest and the segments those manifests list.
+//!   2. Initiator works out what it lacks, plus content manifests newer than
+//!      its own, orders them manifests first then live-first, and sends a
+//!      pull request. It skips ids from untrusted publishers, ids it holds
+//!      waiting for a manifest, and ids it already rejected in this process.
+//!   3. Responder streams requested bundles, in that order. Each bundle is
+//!      RFC 9171 bytes (`crate::wire`) inside a CBOR byte string.
 //!   4. Connection closes
+//!
+//! Every received bundle goes through `BundleStore::admit`, so a segment is
+//! kept only when a signed manifest from a trusted publisher vouches for it.
 //!
 //! Every read is bounded by `FRAME_TIMEOUT`, so a blackholed link fails the
 //! session instead of hanging it.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -24,9 +34,11 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::auth::authenticate_outgoing;
-use crate::bundle::Bundle;
+use crate::bundle::BundleKind;
 use crate::codec::{self, PROTOCOL_VERSION};
-use crate::store::BundleStore;
+use crate::store::{Admission, BundleStore};
+use crate::trust::{KeyId, KeyLookup};
+use crate::wire;
 
 mod order;
 pub use order::*;
@@ -95,6 +107,52 @@ async fn recv_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+// === Rejected ids ===
+
+/// Most rejected ids the router remembers.
+pub const REJECT_CACHE_SIZE: usize = 4096;
+
+/// Ids the admission gate rejected in this process, so they are not pulled
+/// again every session. An entry names the peer that sent the bad copy, so
+/// one bad peer can not block an id that other peers hold. A manifest is
+/// keyed with its version, so a newer version is still pulled. Bounded: the
+/// oldest entry goes first.
+#[derive(Default)]
+struct RejectCache {
+    order: VecDeque<RejectKey>,
+    set: HashSet<RejectKey>,
+}
+
+/// Peer node ID, bundle ID and advertised version.
+type RejectKey = (String, String, u64);
+
+impl RejectCache {
+    fn insert(&mut self, peer: &str, id: &str, version: u64) {
+        let key = (peer.to_string(), id.to_string(), version);
+        if !self.set.insert(key.clone()) {
+            return;
+        }
+        self.order.push_back(key);
+        if self.order.len() > REJECT_CACHE_SIZE {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
+
+    fn contains(&self, peer: &str, id: &str, version: u64) -> bool {
+        self.set.contains(&(peer.to_string(), id.to_string(), version))
+    }
+
+    /// Forget a content's rejections. A segment refused against one manifest
+    /// version can be listed by the next.
+    fn forget_content(&mut self, publisher: &str, content_id: &str) {
+        let prefix = format!("{publisher}/{content_id}/");
+        self.order.retain(|(_, id, _)| !id.starts_with(&prefix));
+        self.set.retain(|(_, id, _)| !id.starts_with(&prefix));
+    }
+}
+
 // === Sync stats ===
 
 #[derive(Debug)]
@@ -112,20 +170,41 @@ pub struct EpidemicRouter {
     pub node_id: String,
     relay_port: u16,
     delay: Duration,
+    /// Publishers whose bundles we accept from peers.
+    trust: Arc<dyn KeyLookup + Send + Sync>,
+    /// Ids rejected in this process, not pulled again.
+    rejected: Mutex<RejectCache>,
 }
 
 impl EpidemicRouter {
-    pub fn new(store: Arc<BundleStore>, node_id: String, relay_port: u16, delay: Duration) -> Self {
-        EpidemicRouter { store, node_id, relay_port, delay }
+    pub fn new(
+        store: Arc<BundleStore>,
+        node_id: String,
+        relay_port: u16,
+        delay: Duration,
+        trust: Arc<dyn KeyLookup + Send + Sync>,
+    ) -> Self {
+        EpidemicRouter { store, node_id, relay_port, delay, trust, rejected: Mutex::default() }
     }
 
-    /// Our manifest: every valid bundle we hold, with its priority.
+    fn rejected(&self) -> std::sync::MutexGuard<'_, RejectCache> {
+        self.rejected.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// True when a peer's entry could pass our admission gate: its publisher
+    /// is trusted and we have not already rejected that peer's copy.
+    fn worth_pulling(&self, peer: &str, e: &ManifestEntry) -> bool {
+        let publisher = e.id.split('/').next().unwrap_or_default();
+        self.trust.lookup(&KeyId(publisher.to_string())).is_some() && !self.rejected().contains(peer, &e.id, e.version)
+    }
+
+    /// Our manifest: every valid manifest we hold, and the segments they list.
     fn manifest(&self) -> Result<Manifest> {
         let entries = self
             .store
-            .all_meta()?
+            .advertised_meta()?
             .into_iter()
-            .map(|m| ManifestEntry { id: m.id.to_string(), priority: m.priority })
+            .map(|m| ManifestEntry { id: m.id, priority: m.priority, version: m.version })
             .collect();
         Ok(Manifest {
             protocol: PROTOCOL_VERSION,
@@ -166,9 +245,16 @@ impl EpidemicRouter {
         let theirs = Self::parse_manifest(&recv_frame(&mut stream).await?)?;
         let peer_id = theirs.node_id.clone();
 
-        // 3. Work out what we're missing, most urgent first
-        let our_ids = self.store.all_ids()?;
-        let missing = pull_order(&theirs.entries, &our_ids, self.delay);
+        // 3. Work out what we're missing, most urgent first. Held segments
+        //    count as ours, and ids we could never admit are skipped, so they
+        //    never take the session's non-urgent slots.
+        let mut our_ids: HashMap<String, u64> = self.store.all_meta()?.into_iter().map(|m| (m.id, m.version)).collect();
+        for id in self.store.held_ids()? {
+            our_ids.entry(id).or_insert(0);
+        }
+        let candidates: Vec<ManifestEntry> = theirs.entries.iter().filter(|e| self.worth_pulling(&peer_id, e)).cloned().collect();
+        let missing = pull_order(&candidates, &our_ids, self.delay);
+        let versions: HashMap<&str, u64> = candidates.iter().map(|e| (e.id.as_str(), e.version)).collect();
 
         info!(
             "Peer {}: they have {}, we have {}, missing {}",
@@ -181,32 +267,55 @@ impl EpidemicRouter {
         // 4. Send pull request
         send_frame(&mut stream, &codec::encode(&PullRequest { bundle_ids: missing.clone() })?).await?;
 
-        // 5. Receive requested bundles, storing each as it arrives
+        // 5. Receive requested bundles and pass each through the admission gate
         let mut received = 0usize;
+        let (mut held, mut rejected) = (Vec::new(), 0usize);
         for id in &missing {
             let raw = recv_frame(&mut stream).await?;
             if raw.is_empty() {
                 debug!("Peer {} doesn't have bundle {}", peer_id, id);
                 continue;
             }
-            let bundle: Bundle = match codec::decode(&raw) {
+            let decoded = codec::decode::<serde_bytes::ByteBuf>(&raw).and_then(|bytes| wire::decode_bundle(&bytes));
+            let bundle = match decoded {
                 Ok(b) => b,
                 Err(e) => {
                     warn!("Bad bundle {} from {}: {}", id, peer_id, e);
                     continue;
                 }
             };
-            if !bundle.verify() {
-                warn!("Integrity check failed for bundle {} from {}", id, peer_id);
-                continue;
-            }
-            if bundle.is_valid() {
-                self.store.insert(&bundle)?;
-                received += 1;
+            match self.store.admit(&bundle, &*self.trust)? {
+                Admission::Stored => {
+                    received += 1;
+                    if bundle.info.kind == BundleKind::Manifest {
+                        self.rejected().forget_content(&bundle.publisher.0, &bundle.info.content_id);
+                    }
+                }
+                Admission::Duplicate => debug!("Already have bundle {}", id),
+                Admission::Held => held.push(id),
+                Admission::Rejected(reason) => {
+                    warn!("Rejected bundle {} from {}: {}", id, peer_id, reason);
+                    self.rejected().insert(&peer_id, id, versions.get(id.as_str()).copied().unwrap_or(0));
+                    rejected += 1;
+                }
             }
         }
+        // Held segments that a manifest later in this session promoted count as received.
+        let promoted = if held.is_empty() {
+            0
+        } else {
+            let ours = self.store.all_ids()?;
+            held.iter().filter(|id| ours.contains(id.as_str())).count()
+        };
+        received += promoted;
 
-        info!("Sync complete with {}: received {} bundles", peer_id, received);
+        info!(
+            "Sync complete with {}: received {} bundles, {} held for a manifest, {} rejected",
+            peer_id,
+            received,
+            held.len() - promoted,
+            rejected
+        );
         Ok(SyncStats { peer_node_id: peer_id, peer_relay_port: theirs.relay_port, received, sent: 0 })
     }
 
@@ -227,12 +336,16 @@ impl EpidemicRouter {
         // 3. Receive their pull request
         let pull: PullRequest = codec::decode(&recv_frame(&mut stream).await?)?;
 
-        // 4. Send requested bundles (empty frame if we don't have it)
+        // 4. Send requested bundles (empty frame if we don't have it). Each
+        //    one leaves with its hop count raised and this node as previous node.
         let mut sent = 0usize;
         for id in &pull.bundle_ids {
             match self.store.get(id)? {
-                Some(bundle) => {
-                    send_frame(&mut stream, &codec::encode(&bundle)?).await?;
+                Some(mut bundle) => {
+                    bundle.hop_count = bundle.hop_count.saturating_add(1);
+                    bundle.previous_node = Some(self.node_id.clone());
+                    let bytes = wire::encode_bundle(&bundle)?;
+                    send_frame(&mut stream, &codec::encode(&serde_bytes::Bytes::new(&bytes))?).await?;
                     sent += 1;
                 }
                 None => {
@@ -249,7 +362,18 @@ impl EpidemicRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle::Priority;
+    use crate::bundle::{Bundle, Priority};
+    use crate::trust::manifest::{Manifest as ContentManifest, SegmentEntry, SignedManifest};
+    use crate::trust::{KeyId, PublisherKey};
+
+    /// Trusts exactly the keys it holds.
+    struct Keys(Vec<PublisherKey>);
+
+    impl KeyLookup for Keys {
+        fn lookup(&self, id: &KeyId) -> Option<[u8; 32]> {
+            self.0.iter().find(|k| k.key_id() == *id).map(|k| k.public())
+        }
+    }
 
     /// A router on a temp store; keeps the tempdir alive as long as it is.
     struct TestRouter {
@@ -265,28 +389,353 @@ mod tests {
     }
 
     fn router(name: &str, port: u16) -> TestRouter {
+        router_trusting(name, port, vec![])
+    }
+
+    fn router_trusting(name: &str, port: u16, keys: Vec<PublisherKey>) -> TestRouter {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(BundleStore::open(dir.path().to_str().unwrap()).unwrap());
-        let router = EpidemicRouter::new(store, name.to_string(), port, Duration::from_secs(120));
+        let router = EpidemicRouter::new(store, name.to_string(), port, Duration::from_secs(120), Arc::new(Keys(keys)));
         TestRouter { router, _dir: dir }
     }
 
-    fn live_bundle(content: &str, seq: u32) -> Bundle {
-        Bundle::new(content, "Match", seq, "video/mp2t", Priority::Live, vec![seq as u8; 64], "ground")
+    fn live_payload(seq: u32) -> Vec<u8> {
+        vec![seq as u8; 64]
+    }
+
+    fn live_bundle(key: &PublisherKey, content: &str, seq: u32) -> Bundle {
+        Bundle::segment(&key.key_id(), content, "Match", seq, "video/mp2t", Priority::Live, live_payload(seq), "ground")
+            .unwrap()
+    }
+
+    /// A signed live manifest, version 1, listing `seqs` with their honest hashes.
+    fn live_manifest(key: &PublisherKey, content: &str, seqs: std::ops::Range<u32>) -> Bundle {
+        live_manifest_v(key, content, 1, seqs)
+    }
+
+    fn live_manifest_v(key: &PublisherKey, content: &str, version: u64, seqs: std::ops::Range<u32>) -> Bundle {
+        let m = ContentManifest {
+            publisher: key.key_id(),
+            content_id: content.into(),
+            title: "Match".into(),
+            version,
+            created_at_ms: 1_700_000_000_000,
+            live: true,
+            segments: seqs
+                .map(|s| SegmentEntry { sequence: s, hash: *blake3::hash(&live_payload(s)).as_bytes(), duration_ms: 10_000 })
+                .collect(),
+        };
+        let signed = SignedManifest::sign(&m, key).unwrap().to_bytes().unwrap();
+        Bundle::manifest(&key.key_id(), &m, signed, "ground")
     }
 
     #[tokio::test]
     async fn sync_pulls_missing_bundles() {
+        let key = PublisherKey::generate();
         let ground = router("ground", 17778);
-        let gateway = router("gateway", 27778);
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        ground.store.insert(&live_manifest(&key, "m", 0..3)).unwrap();
         for s in 0..3 {
-            ground.store.insert(&live_bundle("m", s)).unwrap();
+            ground.store.insert(&live_bundle(&key, "m", s)).unwrap();
         }
         let (a, b) = tokio::io::duplex(1 << 20);
         let (got, served) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
+        // The manifest, pulled first, plus three segments.
+        assert_eq!(got.unwrap().received, 4);
+        assert_eq!(served.unwrap().sent, 4);
+        let id = format!("{}/m/00002", key.key_id());
+        let got = gateway.store.get(&id).unwrap().expect("pulled bundle");
+        assert_eq!(got.payload, live_payload(2));
+        assert_eq!(got.info.sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn each_hop_raises_hop_count_and_names_the_sender() {
+        let key = PublisherKey::generate();
+        let ground = router_trusting("ground", 17778, vec![key.clone()]);
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        let cabin = router_trusting("cabin", 37778, vec![key.clone()]);
+        ground.store.insert(&live_manifest(&key, "m", 0..1)).unwrap();
+        ground.store.insert(&live_bundle(&key, "m", 0)).unwrap();
+        let id = format!("{}/m/00000", key.key_id());
+
+        sync(&gateway, &ground).await;
+        let got = gateway.store.get(&id).unwrap().expect("pulled");
+        assert_eq!((got.hop_count, got.previous_node.as_deref()), (1, Some("ground")));
+        assert_eq!(got.source_node, "ground");
+
+        sync(&cabin, &gateway).await;
+        let got = cabin.store.get(&id).unwrap().expect("relayed");
+        assert_eq!((got.hop_count, got.previous_node.as_deref()), (2, Some("gateway")));
+        // The sender's own copy is unchanged.
+        assert_eq!(ground.store.get(&id).unwrap().unwrap().hop_count, 0);
+    }
+
+    #[tokio::test]
+    async fn router_rejects_tampered_segment_over_a_real_sync() {
+        let key = PublisherKey::generate();
+        let ground = router("ground", 17778);
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        let tampered = |seq: u32| {
+            let mut b = live_bundle(&key, "m", seq);
+            b.payload[10] ^= 0x01;
+            b
+        };
+
+        // The manifest lists 0..4 with honest hashes. Segment 2 is flipped on
+        // the sending side. The manifest is pulled first, so each segment is
+        // checked as it arrives. The held path is covered in the store tests.
+        ground.store.insert(&live_manifest(&key, "m", 0..4)).unwrap();
+        for s in 0..2 {
+            ground.store.insert(&live_bundle(&key, "m", s)).unwrap();
+        }
+        ground.store.insert(&tampered(2)).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (got, _) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
         assert_eq!(got.unwrap().received, 3);
-        assert_eq!(served.unwrap().sent, 3);
-        assert!(gateway.store.get("m/00002").unwrap().is_some());
+
+        // The manifest is now in place on the receiver. Segment 3 arrives
+        // flipped and must be refused straight away.
+        ground.store.insert(&tampered(3)).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (got, _) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
+        assert_eq!(got.unwrap().received, 0);
+
+        let id = |s: u32| format!("{}/m/{:05}", key.key_id(), s);
+        assert!(gateway.store.get(&id(0)).unwrap().is_some());
+        assert!(gateway.store.get(&id(1)).unwrap().is_some());
+        assert!(gateway.store.get(&id(2)).unwrap().is_none(), "tampered segment 2 stored");
+        assert!(gateway.store.get(&id(3)).unwrap().is_none(), "tampered segment stored");
+    }
+
+    /// One session with `from` serving `to`. Returns (received, sent).
+    async fn sync(to: &EpidemicRouter, from: &EpidemicRouter) -> (usize, usize) {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (got, served) = tokio::join!(to.initiate(a), from.handle_incoming(b));
+        (got.unwrap().received, served.unwrap().sent)
+    }
+
+    /// The version of the content manifest a router holds for `m`.
+    fn held_version(r: &EpidemicRouter, key: &PublisherKey) -> u64 {
+        let b = r.store.get(&format!("{}/m/manifest", key.key_id())).unwrap().expect("manifest held");
+        let m: ContentManifest = codec::decode(&SignedManifest::from_bytes(&b.payload).unwrap().manifest_cbor).unwrap();
+        m.version
+    }
+
+    #[tokio::test]
+    async fn peer_pulls_newer_manifest_version() {
+        let key = PublisherKey::generate();
+        let keys = Keys(vec![key.clone()]);
+        let a = router_trusting("a", 17778, vec![key.clone()]);
+        let b = router("b", 27778);
+        assert_eq!(a.store.admit(&live_manifest_v(&key, "m", 1, 0..1), &keys).unwrap(), Admission::Stored);
+        b.store.insert(&live_manifest_v(&key, "m", 2, 0..2)).unwrap();
+        assert_eq!(sync(&a, &b).await, (1, 1));
+        assert_eq!(held_version(&a, &key), 2);
+    }
+
+    #[tokio::test]
+    async fn peer_does_not_pull_equal_or_older_manifest() {
+        let key = PublisherKey::generate();
+        let keys = Keys(vec![key.clone()]);
+        let a = router_trusting("a", 17778, vec![key.clone()]);
+        assert_eq!(a.store.admit(&live_manifest_v(&key, "m", 2, 0..1), &keys).unwrap(), Admission::Stored);
+        for v in [1, 2] {
+            let b = router("b", 27778);
+            b.store.insert(&live_manifest_v(&key, "m", v, 0..3)).unwrap();
+            assert_eq!(sync(&a, &b).await, (0, 0), "version {v}");
+        }
+        assert_eq!(held_version(&a, &key), 2);
+    }
+
+    #[tokio::test]
+    async fn live_sequence_stores_segment_added_by_newer_manifest() {
+        let key = PublisherKey::generate();
+        let keys = Keys(vec![key.clone()]);
+        let a = router_trusting("a", 17778, vec![key.clone()]);
+        let b = router_trusting("b", 27778, vec![key.clone()]);
+        // B publishes version 1 with segments 0..2 (sequences 0, 1 and 2).
+        assert_eq!(b.store.admit(&live_manifest_v(&key, "m", 1, 0..3), &keys).unwrap(), Admission::Stored);
+        for s in 0..3 {
+            assert_eq!(b.store.admit(&live_bundle(&key, "m", s), &keys).unwrap(), Admission::Stored);
+        }
+        assert_eq!(sync(&a, &b).await, (4, 4));
+
+        // B publishes version 2 adding segment 3.
+        assert_eq!(b.store.admit(&live_manifest_v(&key, "m", 2, 0..4), &keys).unwrap(), Admission::Stored);
+        assert_eq!(b.store.admit(&live_bundle(&key, "m", 3), &keys).unwrap(), Admission::Stored);
+        assert_eq!(sync(&a, &b).await, (2, 2));
+        assert_eq!(held_version(&a, &key), 2);
+        let got = a.store.get(&format!("{}/m/00003", key.key_id())).unwrap().expect("segment 3 stored");
+        assert_eq!(got.payload, live_payload(3));
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_unpaired_publisher() {
+        let key = PublisherKey::generate();
+        let ground = router("ground", 17778);
+        let gateway = router("gateway", 27778);
+        ground.store.insert(&live_manifest(&key, "m", 0..1)).unwrap();
+        ground.store.insert(&live_bundle(&key, "m", 0)).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (got, _) = tokio::join!(gateway.initiate(a), ground.handle_incoming(b));
+        assert_eq!(got.unwrap().received, 0);
+        assert!(gateway.store.all_ids().unwrap().is_empty());
+    }
+
+    // === Ids that will never be admitted ===
+
+    fn vod_bundle(key: &PublisherKey, content: &str, seq: u32) -> Bundle {
+        Bundle::segment(&key.key_id(), content, "Film", seq, "video/mp2t", Priority::Vod, live_payload(seq), "ground")
+            .unwrap()
+    }
+
+    fn vod_manifest(key: &PublisherKey, content: &str, seqs: std::ops::Range<u32>) -> Bundle {
+        let m = ContentManifest {
+            publisher: key.key_id(),
+            content_id: content.into(),
+            title: "Film".into(),
+            version: 1,
+            created_at_ms: 1_700_000_000_000,
+            live: false,
+            segments: seqs
+                .map(|s| SegmentEntry { sequence: s, hash: *blake3::hash(&live_payload(s)).as_bytes(), duration_ms: 10_000 })
+                .collect(),
+        };
+        let signed = SignedManifest::sign(&m, key).unwrap().to_bytes().unwrap();
+        Bundle::manifest(&key.key_id(), &m, signed, "ground")
+    }
+
+    /// Run `gateway.initiate` against a scripted peer that advertises
+    /// `entries` and has none of them. Returns the ids the gateway asked for.
+    async fn pull_request_for(gateway: &EpidemicRouter, entries: Vec<ManifestEntry>) -> Vec<String> {
+        let (a, mut b) = tokio::io::duplex(1 << 16);
+        let peer = async move {
+            recv_frame(&mut b).await.unwrap();
+            let m = Manifest { protocol: PROTOCOL_VERSION, node_id: "peer".into(), relay_port: 1, entries };
+            send_frame(&mut b, &codec::encode(&m).unwrap()).await.unwrap();
+            let pull: PullRequest = codec::decode(&recv_frame(&mut b).await.unwrap()).unwrap();
+            for _ in &pull.bundle_ids {
+                send_frame(&mut b, &[]).await.unwrap();
+            }
+            pull.bundle_ids
+        };
+        let (got, ids) = tokio::join!(gateway.initiate(a), peer);
+        got.unwrap();
+        ids
+    }
+
+    #[tokio::test]
+    async fn unpaired_vod_does_not_block_paired_vod() {
+        // The VOD tail is sorted by id, publisher first. Pick keys so the
+        // unpaired one sorts first: without the trust filter its segments
+        // would take every non-urgent slot in every session.
+        let (mut unpaired, mut paired) = (PublisherKey::generate(), PublisherKey::generate());
+        if unpaired.key_id().0 > paired.key_id().0 {
+            std::mem::swap(&mut unpaired, &mut paired);
+        }
+        let ground = router("ground", 17778);
+        let gateway = router_trusting("gateway", 27778, vec![paired.clone()]);
+        for (key, content) in [(&unpaired, "a"), (&paired, "b")] {
+            ground.store.insert(&vod_manifest(key, content, 0..3)).unwrap();
+            for s in 0..3 {
+                ground.store.insert(&vod_bundle(key, content, s)).unwrap();
+            }
+        }
+        sync(&gateway, &ground).await;
+        sync(&gateway, &ground).await;
+        for s in 0..3 {
+            let id = format!("{}/b/{:05}", paired.key_id(), s);
+            assert!(gateway.store.get(&id).unwrap().is_some(), "paired segment {s} not pulled");
+        }
+        assert!(gateway.store.all_meta().unwrap().iter().all(|m| m.publisher == paired.key_id()));
+    }
+
+    #[tokio::test]
+    async fn rejected_segment_is_not_requested_again() {
+        let key = PublisherKey::generate();
+        let ground = router("ground", 17778);
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        ground.store.insert(&vod_manifest(&key, "f", 0..3)).unwrap();
+        let mut tampered = vod_bundle(&key, "f", 0);
+        tampered.payload[0] ^= 1;
+        ground.store.insert(&tampered).unwrap();
+        for s in 1..3 {
+            ground.store.insert(&vod_bundle(&key, "f", s)).unwrap();
+        }
+        // The manifest, then segments 0 (rejected) and 1.
+        assert_eq!(sync(&gateway, &ground).await, (2, 3));
+        // Only segment 2. Segment 0 is not asked for again.
+        assert_eq!(sync(&gateway, &ground).await, (1, 1));
+        assert_eq!(sync(&gateway, &ground).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn held_segment_is_not_pulled_again() {
+        let key = PublisherKey::generate();
+        let gateway = router_trusting("gateway", 27778, vec![key.clone()]);
+        let s = vod_bundle(&key, "f", 0);
+        assert_eq!(gateway.store.admit(&s, &Keys(vec![key.clone()])).unwrap(), Admission::Held);
+        let entry = ManifestEntry { id: s.id().0, priority: Priority::Vod, version: 0 };
+        assert!(pull_request_for(&gateway, vec![entry]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn untrusted_publisher_ids_are_not_requested() {
+        let (stranger, friend) = (PublisherKey::generate(), PublisherKey::generate());
+        let gateway = router_trusting("gateway", 27778, vec![friend.clone()]);
+        let entry = |key: &PublisherKey, rest: &str, version| ManifestEntry {
+            id: format!("{}/{rest}", key.key_id()),
+            priority: Priority::Vod,
+            version,
+        };
+        let entries = vec![entry(&stranger, "f/manifest", 1), entry(&stranger, "f/00000", 0), entry(&friend, "f/manifest", 1)];
+        assert_eq!(pull_request_for(&gateway, entries).await, vec![format!("{}/f/manifest", friend.key_id())]);
+    }
+
+    #[tokio::test]
+    async fn segment_without_a_listing_manifest_is_not_advertised() {
+        let key = PublisherKey::generate();
+        let node = router_trusting("node", 17778, vec![key.clone()]);
+        node.store.insert(&vod_bundle(&key, "f", 0)).unwrap();
+        assert!(node.manifest().unwrap().entries.is_empty());
+
+        // After finish, the manifest lists it, so both are offered.
+        node.store.insert(&vod_manifest(&key, "f", 0..1)).unwrap();
+        let mut ids: Vec<String> = node.manifest().unwrap().entries.into_iter().map(|e| e.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![format!("{}/f/00000", key.key_id()), format!("{}/f/manifest", key.key_id())]);
+
+        // A live segment waits for the rolling manifest that lists it.
+        node.store.insert(&live_manifest(&key, "m", 0..1)).unwrap();
+        node.store.insert(&live_bundle(&key, "m", 0)).unwrap();
+        node.store.insert(&live_bundle(&key, "m", 1)).unwrap();
+        let ids: Vec<String> = node.manifest().unwrap().entries.into_iter().map(|e| e.id).collect();
+        assert!(ids.contains(&format!("{}/m/00000", key.key_id())));
+        assert!(!ids.contains(&format!("{}/m/00001", key.key_id())));
+    }
+
+    #[test]
+    fn reject_cache_is_bounded_and_forgets_a_content() {
+        let mut cache = RejectCache::default();
+        cache.insert("bad", "p/a/00000", 0);
+        cache.insert("bad", "p/a/manifest", 3);
+        cache.insert("bad", "p/b/00000", 0);
+        assert!(cache.contains("bad", "p/a/00000", 0));
+        // Another peer's copy of the same id is still worth pulling.
+        assert!(!cache.contains("good", "p/a/00000", 0));
+        // A rejected manifest version does not block a newer one.
+        assert!(cache.contains("bad", "p/a/manifest", 3) && !cache.contains("bad", "p/a/manifest", 4));
+        cache.forget_content("p", "a");
+        assert!(!cache.contains("bad", "p/a/00000", 0) && !cache.contains("bad", "p/a/manifest", 3));
+        assert!(cache.contains("bad", "p/b/00000", 0));
+
+        for i in 0..REJECT_CACHE_SIZE {
+            cache.insert("bad", &format!("p/c/{i:05}"), 0);
+        }
+        assert_eq!(cache.order.len(), REJECT_CACHE_SIZE);
+        assert!(!cache.contains("bad", "p/b/00000", 0), "oldest entry evicted");
+        assert!(cache.contains("bad", &format!("p/c/{:05}", REJECT_CACHE_SIZE - 1), 0));
     }
 
     #[tokio::test]
@@ -310,7 +759,7 @@ mod tests {
             b
         });
         let err = gateway.initiate(a).await.unwrap_err().to_string();
-        assert!(err.contains("protocol") && err.contains('1') && err.contains('2'), "{}", err);
+        assert!(err.contains("v1") && err.contains("v3"), "{}", err);
         drop(peer.await);
     }
 

@@ -1,5 +1,6 @@
-# 1.87: the highest `rust-version` among the locked dependencies (wit-bindgen).
-FROM rust:1.87-slim AS builder
+# 1.88: bp7 is edition 2024 and uses let chains, which need Rust 1.88.
+# It declares no rust-version, so Cargo.toml sets rust-version to match.
+FROM rust:1.88-slim AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src

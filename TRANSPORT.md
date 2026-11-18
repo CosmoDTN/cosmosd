@@ -1,17 +1,23 @@
 # Writing a CosmosD Transport Plugin
 
 A transport plugin (convergence layer) teaches cosmosd how to carry bundles
-over a new physical medium — LoRa, Reticulum, Bluetooth, ham radio, USB, laser.
+over a new physical medium, such as LoRa, Reticulum, Bluetooth, ham radio, USB
+or laser. Today cosmosd ships only TCP.
 
 ## The interface
 
-Implement two traits in Rust:
+cosmosd is a binary crate. It has no library target, so another crate can not
+`use cosmosd::...` yet. Write a transport inside this repo, next to the TCP
+one. The traits are in `src/transport/mod.rs`. The TCP transport is in
+`src/transport/tcp.rs`. The RFC 9171 encoding is in `src/wire/mod.rs`.
+
+Implement three traits in Rust:
 
 ```rust
 use async_trait::async_trait;
 use anyhow::Result;
-use cosmosd::transport::{BundleStream, BundleListener, ConvergenceLayer, PeerAddr};
-use cosmosd::bundle::Bundle;
+use crate::transport::{BundleStream, BundleListener, ConvergenceLayer, PeerAddr};
+use crate::bundle::Bundle;
 
 // 1. A bidirectional bundle stream with one peer
 pub struct MyStream { /* your connection state */ }
@@ -42,7 +48,7 @@ impl BundleListener for MyListener {
     }
 }
 
-// 3. The convergence layer — entry point cosmosd calls
+// 3. The convergence layer, the entry point cosmosd calls
 pub struct MyTransport { /* config: frequency, baud rate, device path, etc. */ }
 
 #[async_trait]
@@ -63,18 +69,45 @@ impl ConvergenceLayer for MyTransport {
 
 ## Bundle serialization
 
-Bundles are serialized as **length-prefixed JSON** over your stream:
+Bundles travel as RFC 9171 (BPv7) bytes, with a length prefix over your stream:
 
 ```
-[ 4 bytes: payload length (big-endian u32) ][ N bytes: serde_json bundle ]
+[ 4 bytes: bundle length (big-endian u32) ][ N bytes: RFC 9171 bundle ]
 ```
 
-See `src/transport/tcp.rs` for the exact framing. Reuse `send_frame` / `recv_frame`
-if your medium is stream-oriented. For datagram media (LoRa, UDP), adapt as needed.
+`encode_bundle` and `decode_bundle` in `src/wire/mod.rs` turn a `Bundle` into
+those bytes and back. See `src/transport/tcp.rs` for the exact framing. Reuse it if
+your medium is stream-oriented. For datagram media (LoRa, UDP), adapt as needed.
+
+## What a transport can rely on
+
+A transport only moves bytes. It does not need to check them. The receiving
+node does that before it stores anything.
+
+- **Signed content.** Every content item has a publisher with an Ed25519 key.
+  The publisher signs a manifest that lists the BLAKE3 hash of each segment.
+  A node stores a manifest only when its signature checks out, and a segment
+  only when its hash, sequence and duration match the manifest. A corrupted
+  or forged segment is dropped on arrival. The age and the creation time are
+  not signed, so a carrier can change when a bundle expires or where the live
+  edge sits, but not the video itself.
+- **Pairing.** A node accepts content only from its own key and the keys it
+  has paired with `cosmosd keys pair`. Pairing is done by people, out of band.
+  It is never negotiated over a transport. `serve` reads the keys at startup,
+  so a new pairing or a revocation (`keys unpair`) takes effect after a
+  restart of a running node.
+- **Age-based expiry.** A bundle carries its age in the RFC 9171 age block. A
+  node adds the time it held the bundle before sending it on. The bundle
+  expires when its age reaches its lifetime. No wall clock is involved, so a
+  transport needs no clock sync. A slow medium only adds age. Keep the age
+  block when you re-frame a bundle, and do not reset it.
+- **Order.** Bundles may arrive in any order. A segment that arrives before
+  its manifest waits up to 10 minutes for it.
 
 ## Naming convention
 
-Publish your transport as a separate crate and repo:
+Once cosmosd has a library target, a transport can live in its own crate and
+repo. Use these names:
 
 ```
 Crate:  cosmosd-transport-lora

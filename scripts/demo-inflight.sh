@@ -8,6 +8,9 @@
 # The ground node requires a token; the gateway holds it (--peer addr@token)
 # and the cabin, which dials only the gateway, has none.
 #
+# The ground node signs what it ingests. It gets a fresh publisher key and the
+# gateway and cabin pair it. Every key dir is a temp dir under the run dir.
+#
 # The link is cut for 30 s, then for 5 minutes. The player must not stall
 # through the short cut, must stall in the long one, and must end up about
 # two minutes (--delay) behind live. Prints DEMO PASS or DEMO FAIL: <reason>.
@@ -103,10 +106,19 @@ ffmpeg -hide_banner -loglevel warning -nostdin \
     -f mpegts "$SRC_UDP?pkt_size=1316" >"$DIR/source.log" 2>&1 &
 PIDS+=($!)
 
-# === 3. Ground node + live ingest ===
+# === 3. Keys: the ground node publishes, the others pair it ===
+
+for node in ground gateway cabin; do mkdir -p "$DIR/keys/$node"; done
+"$COSMOSD" keys --key-dir "$DIR/keys/ground" init
+PAIRING="$("$COSMOSD" keys --key-dir "$DIR/keys/ground" show | sed -n 1p)"
+for node in gateway cabin; do
+    "$COSMOSD" keys --key-dir "$DIR/keys/$node" pair "$PAIRING"
+done
+
+# === 4. Ground node + live ingest ===
 
 "$COSMOSD" serve --port 17777 --relay-port 17778 --node-id ground --no-discovery \
-    --relay-token demo-secret \
+    --relay-token demo-secret --key-dir "$DIR/keys/ground" \
     --delay "$DELAY" --store "$DIR/ground" >"$DIR/ground.log" 2>&1 &
 PIDS+=($!)
 wait_http http://127.0.0.1:17777/health
@@ -114,20 +126,20 @@ wait_http http://127.0.0.1:17777/health
     >"$DIR/ingest.log" 2>&1 &
 INGEST_PID=$!
 
-# === 4. Simulated satellite link ===
+# === 5. Simulated satellite link ===
 
 "$BIN/examples/linksim" --listen 127.0.0.1:18778 --upstream 127.0.0.1:17778 \
     --rate-kbps 3000 --latency-ms 300 >"$DIR/linksim.log" 2>&1 &
 LINKSIM_PID=$!
 PIDS+=($LINKSIM_PID)
 
-# === 5. Gateway (dials the ground through the link; mDNS on) ===
+# === 6. Gateway (dials the ground through the link; mDNS on) ===
 
 "$COSMOSD" serve --port 27777 --relay-port 27778 --node-id gateway --peer 127.0.0.1:18778@demo-secret \
-    --delay "$DELAY" --store "$DIR/gateway" >"$DIR/gateway.log" 2>&1 &
+    --key-dir "$DIR/keys/gateway" --delay "$DELAY" --store "$DIR/gateway" >"$DIR/gateway.log" 2>&1 &
 PIDS+=($!)
 
-# === 6. Cabin (finds the gateway by mDNS, no --peer) ===
+# === 7. Cabin (finds the gateway by mDNS, no --peer) ===
 
 CABIN_PEER=()
 if [ -n "${DEMO_CABIN_PEER:-}" ]; then
@@ -135,13 +147,13 @@ if [ -n "${DEMO_CABIN_PEER:-}" ]; then
     CABIN_PEER=(--peer 127.0.0.1:27778)
 fi
 "$COSMOSD" serve --port 37777 --relay-port 37778 --node-id cabin --bind 0.0.0.0 \
-    ${CABIN_PEER[@]+"${CABIN_PEER[@]}"} \
+    ${CABIN_PEER[@]+"${CABIN_PEER[@]}"} --key-dir "$DIR/keys/cabin" \
     --delay "$DELAY" --store "$DIR/cabin" >"$DIR/cabin.log" 2>&1 &
 PIDS+=($!)
 wait_http http://127.0.0.1:27777/health
 wait_http http://127.0.0.1:37777/health
 
-# === 7. Player ===
+# === 8. Player ===
 
 say "logs and play.log in $DIR"
 say "watch: ffplay http://127.0.0.1:37777/play/demo (or VLC / Safari); playback starts after ${DELAY}s"
@@ -152,7 +164,7 @@ PLAY_PID=$!
 PIDS+=($PLAY_PID)
 SECONDS=0
 
-# === 8. Timeline (seconds since playcheck started) ===
+# === 9. Timeline (seconds since playcheck started) ===
 
 at() { while [ "$SECONDS" -lt "$1" ]; do sleep 1; done; }
 
